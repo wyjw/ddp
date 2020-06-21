@@ -1,0 +1,46 @@
+From a2d46f25d1d5a26bb6cf90332363290c7ea1aa38 Mon Sep 17 00:00:00 2001
+From: wyjw <yujian.wu1@gmail.com>
+Date: Sun, 21 Jun 2020 23:19:59 +0800
+Subject: [PATCH] first changes to ddp
+
+---
+ include/uapi/linux/bpf.h | 2 ++
+ src/libbpf.c             | 2 ++
+ 2 files changed, 4 insertions(+)
+
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 1968481..e3ed5a9 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -189,6 +189,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_STRUCT_OPS,
+ 	BPF_PROG_TYPE_EXT,
+ 	BPF_PROG_TYPE_LSM,
++	BPF_PROG_TYPE_DDP
+ };
+ 
+ enum bpf_attach_type {
+@@ -226,6 +227,7 @@ enum bpf_attach_type {
+ 	BPF_CGROUP_INET4_GETSOCKNAME,
+ 	BPF_CGROUP_INET6_GETSOCKNAME,
+ 	BPF_XDP_DEVMAP,
++	BPF_DDP,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+diff --git a/src/libbpf.c b/src/libbpf.c
+index 7f01be2..51af8bf 100644
+--- a/src/libbpf.c
++++ b/src/libbpf.c
+@@ -6689,6 +6689,8 @@ static const struct bpf_sec_def section_defs[] = {
+ 						BPF_SK_MSG_VERDICT),
+ 	BPF_APROG_SEC("lirc_mode2",		BPF_PROG_TYPE_LIRC_MODE2,
+ 						BPF_LIRC_MODE2),
++	BPF_APROG_SEC("ddp",		BPF_PROG_TYPE_DDP,
++						BPF_DDP),
+ 	BPF_APROG_SEC("flow_dissector",		BPF_PROG_TYPE_FLOW_DISSECTOR,
+ 						BPF_FLOW_DISSECTOR),
+ 	BPF_EAPROG_SEC("cgroup/bind4",		BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
+-- 
+2.25.1
+
