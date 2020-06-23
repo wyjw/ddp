@@ -1,3 +1,6 @@
 [submodule "libbpf"]
 	path = libbpf
 	url = https://github.com/libbpf/libbpf.git
+[submodule "uring-bench"]
+	path = uring-bench
+	url = https://github.com/wyjw/uring-bench.git
