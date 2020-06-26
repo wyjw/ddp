@@ -189,7 +189,7 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_STRUCT_OPS,
 	BPF_PROG_TYPE_EXT,
 	BPF_PROG_TYPE_LSM,
-	BPF_PROG_TYPE_DDP
+	BPF_PROG_TYPE_DDP,
 };
 
 enum bpf_attach_type {

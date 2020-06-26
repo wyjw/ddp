@@ -1,1 +1,6 @@
 kernel/
+vm/
+vm/*
+
+*.a
+*.out
