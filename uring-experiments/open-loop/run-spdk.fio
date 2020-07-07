@@ -1,0 +1,30 @@
+[global]
+
+filename=trtype=PCIe traddr=0000.02.00.0 ns=1
+
+#ioengine=io_uring
+#fixedbufs=1
+#registerfiles=1
+
+thread=1 # Needed for spdk, so use for all for congruence.
+
+iodepth=1024
+bs=4096
+direct=1
+
+group_reporting=1
+
+size=128Gi
+
+#lat_percentiles=1
+#percentile_list=50:99:99.9
+
+time_based=1
+ramp_time=30
+clocksource=cpu
+
+rw=randread
+stonewall
+
+[run]
+

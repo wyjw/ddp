@@ -1,0 +1,14 @@
+#!/bin/bash
+
+function dump() {
+  awk '/nvme[0-9]q/ {total = total + $2 + $3 + $4 + $5 + $6 + $7} END { print total }' < /proc/interrupts
+}
+
+last=$(dump)
+
+while true; do
+  now=$(dump)
+  echo $((now - last))
+  last=$now
+  sleep 1
+done

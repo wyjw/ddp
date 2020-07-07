@@ -1,0 +1,89 @@
+#!/bin/bash
+
+set -e
+
+dir="$(dirname "$0")"
+source "$dir/../config.sh"
+
+engines=(io_uring)
+
+logdir=$(mklogdir open-loop)
+echo "Logging results in $logdir"
+
+iters=1
+runtime=15
+njobs="2"
+
+for i in $(seq 1 $iters); do
+  for dev in "${DEVS[@]}"; do
+    for numjobs in $njobs; do
+      for engine in "${engines[@]}"; do
+        if [[ "$engine" == "spdk" ]]; then
+          $dir/../scripts/spdk-enable || true
+          fiofile="$dir/run-spdk.fio"
+        else
+          $dir/../scripts/spdk-disable || true
+          # Reattaching after SPDK shows right perms, but we seem to get perm
+          # denied unless we reset the permissions
+          sudo chmod ugo+rw "$dev"
+          fiofile="$dir/run.fio"
+        fi
+
+        for iops in 500000 700000 900000 1100000 1300000; do
+          for poll in 2; do
+            proc_iops=$(($iops / $numjobs))
+
+            cmdprefix="sudo" # May be best to always run as root for congruence/cache flush.
+            pollopt=""
+            if [[ "$poll" == "1" || "$poll" == "2" ]]; then
+              if [[ "$engine" != "io_uring" ]]; then
+                continue
+              else
+                if [[ "$poll" == "1" ]]; then
+                  pollopt="--hipri=1"
+                else
+                  pollopt="--hipri=1 --sqthread_poll=$poll"
+                fi
+                cmdprefix="sudo"
+		# newjobs=$(($numjobs - 1))
+		# proc_iops=$(($iops / $newjobs))
+              fi
+            fi
+
+            echo == Engine $engine Dev $dev Jobs $numjobs TargetIOPS $iops $proc_iops Polling $poll ==
+
+            devfn="--filename=$dev"
+            if [[ "$engine" == "spdk" ]]; then
+              cmdprefix="sudo" # Need root for SPDK.
+              devfn="--filename=${SPDKDEVS[$dev]}"
+              if [[ "$devfn" == "" ]]; then
+                echo "ERROR SPDK device string not found in config SPDKDEVS for $dev"
+                exit -1
+              fi
+              devfn="" # Above doesn't work - doesn't seem to be a way to pass SPDK dev
+                       # string as filename param for fio from commandline, so hacked into
+                       # an alternate fio file instead.
+            fi
+
+            $cmdprefix $dir/../scripts/fio $fiofile \
+              $devfn \
+              --rate_iops=$proc_iops \
+              --numjobs=$numjobs \
+              --runtime=$runtime \
+              --ioengine=$engine \
+              $pollopt \
+              --minimal
+          done | tee -a "$logdir/output.log"
+
+          # Replot after each iteration for incremental output
+          awk -f "$dir/parse.awk" < "$logdir/output.log" > "$logdir/output.data"
+          python3 "$dir/plot.py" "$logdir"
+
+	  ./uring-bench/cleanup
+          # Push results back to central results repo
+          #sync_results
+        done
+      done
+    done
+  done
+done

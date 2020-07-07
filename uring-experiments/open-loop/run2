@@ -1,0 +1,143 @@
+#!/bin/bash
+
+set -e
+
+dir="$(dirname "$0")"
+source "$dir/../config.sh"
+# engines=( spdk)
+# engines=( io_uring)
+# engines=( libaio)
+engines=(io_uring spdk libaio)
+logdir=$(mklogdir open-loop)
+echo "Logging results in $logdir"
+per_dev_iodepth=32
+file_service="random:$per_dev_iodepth"
+iters=1
+runtime=20
+# njobs="1 3 4 6"
+njobs="6"
+
+dev_list="/dev/nvme0n1:/dev/nvme1n1:/dev/nvme2n1"
+# dev_list="/dev/nvme0n1 "
+
+for j in $(seq 1 $iters); do
+    for dev in $dev_list; do
+        for numjobs in $njobs; do
+            for engine in "${engines[@]}"; do
+                # echo $engine
+                if [[ "$engine" == "spdk" ]]; then
+                    $dir/../scripts/spdk-enable || true
+                    fiofile="$dir/run-spdk.fio"
+                    if [[ "$dev_list" == *":"* ]]; then
+                        echo "spdk multiple device"
+                        traddr="$dev_list"
+                        for i in 0 1 2 3; do
+                            if [[ "$dev_list" == *"nvme${i}n1"* ]]; then
+                                # traddr="${SPDKDEVS[$dev]}"
+                                # echo "'${SPDKDEVS["/dev/nvme${i}n1"]}'"
+                                traddr="$(echo $traddr | sed "s/\/dev\/nvme${i}n1/${SPDKDEVS["/dev/nvme${i}n1"]}/g")"
+
+                            fi
+                        done
+                        # echo $traddr
+                        sed -i "s/filename=.*/filename=$traddr/g" $fiofile
+
+                    else
+                        echo "spdk single device"
+
+                        traddr="${SPDKDEVS[$dev]}"
+                        # echo $traddr
+                        sed -i "s/filename=.*/filename=$traddr/g" $fiofile
+                    fi
+
+                else
+                    $dir/../scripts/spdk-disable || true
+                    if [[ "$engine" == "io_uring" ]]; then
+                        # Reattaching after SPDK shows right perms, but we seem to get perm
+                        # denied unless we reset the permissions
+                        # sudo chmod ugo+rw "$dev"
+                        fiofile="$dir/run.fio"
+                    elif [[ "$engine" == "libaio" ]]; then
+                        # Reattaching after SPDK shows right perms, but we seem to get perm
+                        # denied unless we reset the permissions
+                        # sudo chmod ugo+rw "$dev"
+                        fiofile="$dir/run-libaio.fio"
+                    fi
+                fi
+                for iops in 700000 1000000 1500000; do
+                    for poll in 2; do
+                        proc_iops=$(($iops / $numjobs))
+                        proc_iodepth=$per_dev_iodepth
+                        cmdprefix="sudo" # May be best to always run as root for congruence/cache flush.
+                        pollopt=""
+                        if [[ "$engine" == "io_uring" ]]; then
+
+                            if [[ "$poll" == "1" || "$poll" == "2" ]]; then
+                                if [[ "$engine" != "io_uring" ]]; then
+                                    continue
+                                else
+                                    if [[ "$poll" == "1" ]]; then
+                                        pollopt="--hipri=1 --sqthread_poll=0"
+                                    else
+                                        pollopt="--hipri=1 --sqthread_poll=$poll"
+                                    fi
+                                    cmdprefix="sudo" # Need root to create sqthread for polling.
+                                fi
+                            else
+                                pollopt="--hipri=0 --sqthread_poll=0"
+                            fi
+			else
+				if [[ "$poll" != "0" ]]; then
+					continue
+				fi
+                        fi
+
+                        traddr="$(echo $traddr | sed "s/\/dev\/nvme${i}n1/${SPDKDEVS["/dev/nvme${i}n1"]}/g")"
+                        a="$(echo $dev | grep -o : | wc -l)"
+                        dev_name=$dev
+                        if [[ a != "0" ]]; then
+                            dev_name="$(($a + 1))"
+
+                        fi
+
+                        echo == Engine $engine Dev $dev_name Jobs $numjobs TargetIOPS $iops $proc_iops Polling $poll ==
+
+                        devfn="--filename=$dev"
+                        if [[ "$engine" == "spdk" ]]; then
+                            cmdprefix="sudo" # Need root for SPDK.
+                            devfn="--filename=${SPDKDEVS[$dev]}"
+                            if [[ "$devfn" == "" ]]; then
+                                echo "ERROR SPDK device string not found in config SPDKDEVS for $dev"
+                                exit -1
+                            fi
+                            devfn="" # Above doesn't work - doesn't seem to be a way to pass SPDK dev
+                            # string as filename param for fio from commandline, so hacked into
+                            # an alternate fio file instead.
+                        fi
+                        VAR="$cmdprefix $dir/../scripts/fio $fiofile $devfn --rate_iops=$proc_iops --numjobs=$numjobs -runtime=$runtime --ioengine=$engine --iodepth=$proc_iodepth --file_service_type=$file_service $pollopt"
+                        
+                        echo $VAR
+
+                        $cmdprefix $dir/../scripts/fio $fiofile \
+                            $devfn \
+                            --rate_iops=$proc_iops \
+                            --numjobs=$numjobs \
+                            --runtime=$runtime \
+                            --ioengine=$engine \
+                            --iodepth=$proc_iodepth --file_service_type=$file_service $pollopt \
+                            --minimal
+                        #	      --debug=parse
+                    done | tee -a "$logdir/output.log"
+                    #         echo "fio jobs done!!"
+                    # Replot after each iteration for incremental output
+                    # Push results back to central results repo
+                    # sync_results
+                done
+                # Plot a curve
+                python3 "$dir/plot.py" "$logdir"
+                sync_results
+            done
+        done
+    done
+done
+

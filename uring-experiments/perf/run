@@ -1,0 +1,57 @@
+#!/bin/bash
+
+set -e
+
+dir="$(dirname "$0")"
+source "$dir/../config.sh"
+
+logdir=$(mklogdir perf)
+echo "Logging results in $logdir"
+
+iters=1
+runtime=120
+
+for i in $(seq 1 $iters); do
+  for dev in "${DEVS[@]}"; do
+    for iodepth in 1 2 4 8 16 32 64 128 256 512 1024; do
+
+      for i in $(seq 1 $iters); do
+        echo == Engine spdk Dev $dev IOdepth $iodepth ==
+        $dir/../scripts/spdk-enable || true
+        sudo ./spdk/examples/nvme/perf/perf \
+          -r "'${SPDKDEVS[$dev]}'" \
+          -q $iodepth \
+          -o 4096 \
+          -w randread \
+          -L \
+          -t $runtime
+
+        $dir/../scripts/spdk-disable || true
+        echo == Engine aio Dev $dev IOdepth $iodepth ==
+        # Queue depth
+        # 4 KB I/Os
+        # IO queues per namespace
+        # randread pattern
+        # dump latency summary
+        # run for 30 seconds
+        # Disable SQ in controller memory buffer (default 1)
+        # $dir/../scripts/spdk-disable || true
+        sudo ./spdk/examples/nvme/perf/perf \
+          $dev \
+          -q $iodepth \
+          -o 4096 \
+          -w randread \
+          -L \
+          -t $runtime
+
+      done | tee -a "$logdir/output.log"
+
+      # Replot after each iteration for incremental output
+      awk -f "$dir/parse.awk" < "$logdir/output.log" > "$logdir/output.data"
+      python3 "$dir/plot.py" "$logdir"
+
+      # Push results back to central results repo
+      sync_results
+    done
+  done
+done

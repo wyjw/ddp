@@ -1,0 +1,9 @@
+#!/bin/bash
+
+if [[ $(basename $(pwd)) == 'scripts' ]]; then
+  echo 'Run this from the top level directory of the repo.'
+  exit -1
+fi
+
+sudo bash -c "PCI_WHITELIST='0000:02:00.0' $PWD/spdk/scripts/setup.sh reset"
+
