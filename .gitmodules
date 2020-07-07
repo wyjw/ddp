@@ -4,3 +4,6 @@
 [submodule "uring-bench"]
 	path = uring-bench
 	url = https://github.com/wyjw/uring-bench.git
+[submodule "uring-experiments/uring-bench"]
+	path = uring-experiments/uring-bench
+	url = https://github.com/wyjw/uring-bench.git
