@@ -1,0 +1,268 @@
+From 49945aeb7644bb5cd5a73fb30515e1f4a6997c5e Mon Sep 17 00:00:00 2001
+From: wyjw <yujian.wu1@gmail.com>
+Date: Tue, 7 Jul 2020 14:44:21 +0800
+Subject: [PATCH] First attempt at the dependency mechanism.
+
+---
+ block/blk-mq.c                | 40 +++++++++++++++++++++++++++++++++++
+ drivers/nvme/host/core.c      | 28 ++++++++++++++++++++++++
+ fs/io_uring.c                 |  4 ++++
+ include/linux/blk-mq.h        |  7 ++++++
+ include/linux/blkdev.h        |  3 +++
+ include/linux/fs.h            |  1 +
+ include/trace/events/block.h  | 35 ++++++++++++++++++++++++++++++
+ include/uapi/linux/io_uring.h |  1 +
+ 8 files changed, 119 insertions(+)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 4f57d27bfa73..21cb891fa799 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -41,6 +41,10 @@
+ #include "blk-mq-sched.h"
+ #include "blk-rq-qos.h"
+ 
++// alter
++#define ALTER_HEAD_SIZE (PAGE_SIZE / sizeof(struct hlist_head))
++static struct hlist_head alter_list[ALTER_HEAD_SIZE];
++
+ static void blk_mq_poll_stats_start(struct request_queue *q);
+ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
+ 
+@@ -710,6 +714,37 @@ void blk_mq_start_request(struct request *rq)
+ }
+ EXPORT_SYMBOL(blk_mq_start_request);
+ 
++static void __blk_mq_alter_resubmit_request(struct request *rq)
++{
++	struct request_queue *q = rq->q;
++
++	blk_mq_put_driver_tag(rq);
++
++	trace_block_rq_alter_submit(q, rq);
++	rq_qos_requeue(q, rq);
++
++	if (blk_mq_request_started(rq)) {
++		WRITE_ONCE(rq->state, MQ_RQ_IDLE);
++		rq->rq_flags &= ~RQF_TIMED_OUT;
++	}
++
++	//printk(KERN_ERR "Resubmitted.\n");
++}
++
++// alter
++void blk_mq_alter_resubmit_request(struct request *rq)
++{
++	__blk_mq_alter_resubmit_request(rq);
++
++	/* this request will be re-inserted to io scheduler queue */
++	blk_mq_sched_requeue_request(rq);
++
++	BUG_ON(!list_empty(&rq->queuelist));
++	blk_mq_add_to_requeue_list(rq, true, true);
++
++}
++EXPORT_SYMBOL(blk_mq_alter_resubmit_request);
++
+ static void __blk_mq_requeue_request(struct request *rq)
+ {
+ 	struct request_queue *q = rq->q;
+@@ -1827,6 +1862,8 @@ static void blk_mq_bio_to_request(struct request *rq, struct bio *bio,
+ 
+ 	rq->__sector = bio->bi_iter.bi_sector;
+ 	rq->write_hint = bio->bi_write_hint;
++	//rq->alter_count = 0;
++	//rq->total_count = 4;
+ 	blk_rq_bio_prep(rq, bio, nr_segs);
+ 	blk_crypto_rq_bio_prep(rq, bio, GFP_NOIO);
+ 
+@@ -2074,6 +2111,9 @@ blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ 		return BLK_QC_T_NONE;
+ 	}
+ 
++	rq->alter_count = 0;
++	rq->total_count = 4;
++
+ 	plug = blk_mq_plug(q, bio);
+ 	if (unlikely(is_flush_fua)) {
+ 		/* Bypass scheduler for flush requests */
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index c2c5bc4fb702..d06ff82e3efe 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -268,6 +268,25 @@ static void nvme_retry_req(struct request *req)
+ 	blk_mq_delay_kick_requeue_list(req->q, delay);
+ }
+ 
++static void nvme_alter_resubmit_req(struct request *req)
++{
++	/*
++	struct nvme_ns *ns = req->q->queuedata;
++	unsigned long delay = 0;
++	u16 crd;
++
++	// The mask and shift result must be <= 3
++	crd = (nvme_req(req)->status & NVME_SC_CRD) >> 11;
++	if (ns && crd)
++		delay = ns->ctrl->crdt[crd - 1] * 100;
++
++	nvme_req(req)->retries++;
++	*/
++	req->alter_count++;
++	blk_mq_alter_resubmit_request(req);
++	//blk_mq_delay_kick_requeue_list(req->q, delay);
++}
++
+ void nvme_complete_rq(struct request *req)
+ {
+ 	blk_status_t status = nvme_error_status(nvme_req(req)->status);
+@@ -289,6 +308,15 @@ void nvme_complete_rq(struct request *req)
+ 		}
+ 	}
+ 
++	//printk(KERN_ERR "Got here alter: %d, total: %d\n", req->alter_count, req->total_count);
++	if (req->alter_count < req->total_count)
++	{
++		nvme_alter_resubmit_req(req);
++		return;
++	}
++
++
++	//printk(KERN_ERR "Got here\n");
+ 	nvme_trace_bio_complete(req, status);
+ 	blk_mq_end_request(req, status);
+ }
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 155f3d830ddb..ab66b68cc709 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -657,6 +657,9 @@ struct io_kiocb {
+ 
+ 	struct percpu_ref	*fixed_file_refs;
+ 
++	// alter
++	u32			dep;
++
+ 	union {
+ 		/*
+ 		 * Only commands that never go async can use the below fields,
+@@ -1286,6 +1289,7 @@ static void __io_cqring_fill_event(struct io_kiocb *req, long res, long cflags)
+ 		WRITE_ONCE(cqe->user_data, req->user_data);
+ 		WRITE_ONCE(cqe->res, res);
+ 		WRITE_ONCE(cqe->flags, cflags);
++		WRITE_ONCE(cqe->dep, req->dep);
+ 	} else if (ctx->cq_overflow_flushed) {
+ 		WRITE_ONCE(ctx->rings->cq_overflow,
+ 				atomic_inc_return(&ctx->cached_cq_overflow));
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index d6fcae17da5a..753f448a536b 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -390,6 +390,12 @@ struct blk_mq_ops {
+ #endif
+ };
+ 
++// Way to go from one blk ops to another
++typedef void (alter_bio_fn)(struct bio *);
++struct blk_mq_dep_ops {
++	alter_bio_fn	*alter_bio;	
++};
++
+ enum {
+ 	BLK_MQ_F_SHOULD_MERGE	= 1 << 0,
+ 	BLK_MQ_F_TAG_SHARED	= 1 << 1,
+@@ -500,6 +506,7 @@ void blk_mq_start_request(struct request *rq);
+ void blk_mq_end_request(struct request *rq, blk_status_t error);
+ void __blk_mq_end_request(struct request *rq, blk_status_t error);
+ 
++void blk_mq_alter_resubmit_request(struct request *rq);
+ void blk_mq_requeue_request(struct request *rq, bool kick_requeue_list);
+ void blk_mq_kick_requeue_list(struct request_queue *q);
+ void blk_mq_delay_kick_requeue_list(struct request_queue *q, unsigned long msecs);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 8fd900998b4e..1eb19bfd104b 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -246,6 +246,9 @@ struct request {
+ 	 */
+ 	rq_end_io_fn *end_io;
+ 	void *end_io_data;
++
++	unsigned int alter_count;
++	unsigned int total_count;
+ };
+ 
+ static inline bool blk_op_is_scsi(unsigned int op)
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 6c4ab4dc1cd7..1e3061a7fbad 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -329,6 +329,7 @@ struct kiocb {
+ 	u16			ki_hint;
+ 	u16			ki_ioprio; /* See linux/ioprio.h */
+ 	unsigned int		ki_cookie; /* for ->iopoll */
++	u32			dep;
+ 
+ 	randomized_struct_fields_end
+ };
+diff --git a/include/trace/events/block.h b/include/trace/events/block.h
+index 1257f26bb887..6948120cdf98 100644
+--- a/include/trace/events/block.h
++++ b/include/trace/events/block.h
+@@ -101,6 +101,41 @@ TRACE_EVENT(block_rq_requeue,
+ 		  __entry->nr_sector, 0)
+ );
+ 
++
++/**
++ * block_rq_requeue - place altered and resubmitted back on queue
++ */
++TRACE_EVENT(block_rq_alter_submit,
++
++	TP_PROTO(struct request_queue *q, struct request *rq),
++
++	TP_ARGS(q, rq),
++
++	TP_STRUCT__entry(
++		__field(  dev_t,	dev			)
++		__field(  sector_t,	sector			)
++		__field(  unsigned int,	nr_sector		)
++		__array(  char,		rwbs,	RWBS_LEN	)
++		__dynamic_array( char,	cmd,	1		)
++	),
++
++	TP_fast_assign(
++		__entry->dev	   = rq->rq_disk ? disk_devt(rq->rq_disk) : 0;
++		__entry->sector    = blk_rq_trace_sector(rq);
++		__entry->nr_sector = blk_rq_trace_nr_sectors(rq);
++
++		blk_fill_rwbs(__entry->rwbs, rq->cmd_flags, blk_rq_bytes(rq));
++		__get_str(cmd)[0] = '\0';
++	),
++
++	TP_printk("%d,%d %s (%s) %llu + %u [%d]",
++		  MAJOR(__entry->dev), MINOR(__entry->dev),
++		  __entry->rwbs, __get_str(cmd),
++		  (unsigned long long)__entry->sector,
++		  __entry->nr_sector, 0)
++);
++
++
+ /**
+  * block_rq_complete - block IO operation completed by device driver
+  * @rq: block operations request
+diff --git a/include/uapi/linux/io_uring.h b/include/uapi/linux/io_uring.h
+index 92c22699a5a7..3857f673f6ed 100644
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@ -158,6 +158,7 @@ struct io_uring_cqe {
+ 	__u64	user_data;	/* sqe->data submission passed back */
+ 	__s32	res;		/* result code for this event */
+ 	__u32	flags;
++	__u32	dep;
+ };
+ 
+ /*
+-- 
+2.25.1
+

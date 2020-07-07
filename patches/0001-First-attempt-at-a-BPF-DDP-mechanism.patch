@@ -1,0 +1,372 @@
+From 3256a069cf9305903e5f1bc0d71fb33b9491a6b7 Mon Sep 17 00:00:00 2001
+From: wyjw <yujian.wu1@gmail.com>
+Date: Sun, 21 Jun 2020 23:11:01 +0800
+Subject: [PATCH] First attempt at a BPF DDP mechanism.
+
+---
+ fs/io_uring.c             | 161 ++++++++++++++++++++++++++++++++++----
+ include/linux/bpf.h       |   1 +
+ include/linux/bpf_ddp.h   |  11 +++
+ include/linux/bpf_types.h |   5 +-
+ include/uapi/linux/bpf.h  |   2 +
+ kernel/bpf/syscall.c      |   8 ++
+ kernel/bpf/verifier.c     |   5 ++
+ 7 files changed, 174 insertions(+), 19 deletions(-)
+ create mode 100644 include/linux/bpf_ddp.h
+
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 155f3d830ddb..ce711c5c9e09 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -79,6 +79,8 @@
+ #include <linux/splice.h>
+ #include <linux/task_work.h>
+ 
++#include <linux/bpf.h>
++
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/io_uring.h>
+ 
+@@ -339,6 +341,15 @@ struct io_ring_ctx {
+ 	struct work_struct		exit_work;
+ };
+ 
++struct ddp_info{
++	struct bpf_prog __rcu *ddp_prog;
++};
++
++//Schedule adjustments
++static struct ddp_info *di;
++
++
++
+ /*
+  * First field must be the file pointer in all the
+  * iocb unions! See also 'struct kiocb' in <linux/fs.h>
+@@ -1269,36 +1280,147 @@ static bool io_cqring_overflow_flush(struct io_ring_ctx *ctx, bool force)
+ 	return cqe != NULL;
+ }
+ 
++static const struct bpf_func_proto *
++ddp_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++	return bpf_base_func_proto(func_id);
++}
++
++/*
++static bool ddp_is_valid_access(int off, int size,
++					   enum bpf_access_type type,
++					   const struct bpf_prog *prog,
++					   struct bpf_insn_access_aux *info)
++{
++	if (type == BPF_WRITE) {
++		switch (off) {
++		case bpf_ctx_range_till(struct __sk_buff, cb[0], cb[4]):
++			break;
++		default:
++			return false;
++		}
++	}
++
++	switch (off) {
++	case bpf_ctx_range(struct __sk_buff, data):
++		info->reg_type = PTR_TO_PACKET;
++		break;
++	case bpf_ctx_range(struct __sk_buff, data_end):
++		info->reg_type = PTR_TO_PACKET_END;
++		break;
++	case bpf_ctx_range(struct __sk_buff, flow_keys):
++		info->reg_type = PTR_TO_FLOW_KEYS;
++		break;
++	case bpf_ctx_range(struct __sk_buff, tc_classid):
++	case bpf_ctx_range(struct __sk_buff, data_meta):
++	case bpf_ctx_range_till(struct __sk_buff, family, local_port):
++		return false;
++	}
++
++	return bpf_skb_is_valid_access(off, size, type, prog, info);
++}
++*/
++
++static bool ddp_is_valid_access(int off, int size,
++					   enum bpf_access_type type,
++					   const struct bpf_prog *prog,
++					   struct bpf_insn_access_aux *info)
++{
++	return true;
++}
++
++const struct bpf_verifier_ops ddp_verifier_ops = {
++	.get_func_proto		= ddp_func_proto,
++	.is_valid_access	= ddp_is_valid_access,
++};
++
++const struct bpf_prog_ops ddp_prog_ops = {
++};
++
++
++static DEFINE_MUTEX(ddp_mutex);
++
++int ddp_bpf_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++{
++	printk(KERN_ERR "BPF Prog is attached.");
++	struct bpf_prog *attached;
++
++	mutex_lock(&ddp_mutex);
++	attached = rcu_dereference_protected(di->ddp_prog, lockdep_is_held(&ddp_mutex));
++
++	if (attached) {
++		mutex_unlock(&ddp_mutex);
++		return -EEXIST;
++	}
++
++	rcu_assign_pointer(di->ddp_prog, prog);
++	mutex_unlock(&ddp_mutex);
++	return 0;
++}
++
++int ddp_bpf_prog_detach(const union bpf_attr *attr)
++{
++	printk(KERN_ERR "BPF Prog is detached.");
++	struct bpf_prog *attached;
++
++	mutex_lock(&ddp_mutex);
++	attached = rcu_dereference_protected(di->ddp_prog, lockdep_is_held(%ddp_mutex));
++
++	if (!attached) {
++		mutex_unlock(&ddp_mutex);
++		return -ENOENT;
++	}
++
++	bpf_prog_put(attached);
++	RCU_INIT_POINTER(di->ddp_prog, NULL);
++	mutex_unlock(&ddp_mutex);
++	return 0;
++}
++
+ static void __io_cqring_fill_event(struct io_kiocb *req, long res, long cflags)
+ {
+ 	struct io_ring_ctx *ctx = req->ctx;
+ 	struct io_uring_cqe *cqe;
++	struct bpf_prog *attached;
++	u32 result = 1;
+ 
+ 	trace_io_uring_complete(ctx, req->user_data, res);
+ 
++	attached = di ? rcu_dereference(di->ddp_prog) : NULL;
++	rcu_read_lock();
++	if (attached) {
++		printk(KERN_ERR "BPF Prog is used.");
++		//bpf_compute_data_pointers((struct ddp_buff *)skb);
++		// Check the struct
++		result = BPF_PROG_RUN(attached, req->user_data);
++	}
++	rcu_read_unlock();
++
+ 	/*
+ 	 * If we can't get a cq entry, userspace overflowed the
+ 	 * submission (by quite a lot). Increment the overflow count in
+ 	 * the ring.
+ 	 */
+-	cqe = io_get_cqring(ctx);
+-	if (likely(cqe)) {
+-		WRITE_ONCE(cqe->user_data, req->user_data);
+-		WRITE_ONCE(cqe->res, res);
+-		WRITE_ONCE(cqe->flags, cflags);
+-	} else if (ctx->cq_overflow_flushed) {
+-		WRITE_ONCE(ctx->rings->cq_overflow,
+-				atomic_inc_return(&ctx->cached_cq_overflow));
+-	} else {
+-		if (list_empty(&ctx->cq_overflow_list)) {
+-			set_bit(0, &ctx->sq_check_overflow);
+-			set_bit(0, &ctx->cq_check_overflow);
++	if (result == 0) {
++		cqe = io_get_cqring(ctx);
++		if (likely(cqe)) {
++			WRITE_ONCE(cqe->user_data, req->user_data);
++			WRITE_ONCE(cqe->res, res);
++			WRITE_ONCE(cqe->flags, cflags);
++		} else if (ctx->cq_overflow_flushed) {
++			WRITE_ONCE(ctx->rings->cq_overflow,
++					atomic_inc_return(&ctx->cached_cq_overflow));
++		} else {
++			if (list_empty(&ctx->cq_overflow_list)) {
++				set_bit(0, &ctx->sq_check_overflow);
++				set_bit(0, &ctx->cq_check_overflow);
++			}
++			req->flags |= REQ_F_OVERFLOW;
++			refcount_inc(&req->refs);
++			req->result = res;
++			req->cflags = cflags;
++			list_add_tail(&req->list, &ctx->cq_overflow_list);
+ 		}
+-		req->flags |= REQ_F_OVERFLOW;
+-		refcount_inc(&req->refs);
+-		req->result = res;
+-		req->cflags = cflags;
+-		list_add_tail(&req->list, &ctx->cq_overflow_list);
+ 	}
+ }
+ 
+@@ -8172,6 +8294,11 @@ static int __init io_uring_init(void)
+ 	BUILD_BUG_ON(ARRAY_SIZE(io_op_defs) != IORING_OP_LAST);
+ 	BUILD_BUG_ON(__REQ_F_LAST_BIT >= 8 * sizeof(int));
+ 	req_cachep = KMEM_CACHE(io_kiocb, SLAB_HWCACHE_ALIGN | SLAB_PANIC);
++	
++	di = kmalloc(sizeof(struct ddp_info), GFP_NOWAIT);
++	if (!di)
++		printk(KERN_ERR "Broken initialization of di");
++
+ 	return 0;
+ };
+ __initcall(io_uring_init);
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 07052d44bca1..4c598a441c79 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -330,6 +330,7 @@ enum bpf_reg_type {
+ 	PTR_TO_BTF_ID_OR_NULL,	 /* reg points to kernel struct or NULL */
+ 	PTR_TO_MEM,		 /* reg points to valid memory region */
+ 	PTR_TO_MEM_OR_NULL,	 /* reg points to valid memory region or NULL */
++	PTR_TO_DDP_KEYS	/* reg points to struct ddp_keys */
+ };
+ 
+ /* The information passed from prog-specific *_is_valid_access
+diff --git a/include/linux/bpf_ddp.h b/include/linux/bpf_ddp.h
+new file mode 100644
+index 000000000000..82e1c348d34e
+--- /dev/null
++++ b/include/linux/bpf_ddp.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _BPF_DDP_H
++#define _BPF_DDP_H
++
++#include <uapi/linux/bpf.h>
++
++int ddp_bpf_prog_attach(const union bpf_attr *attr, struct bpf_prog *prog);
++int ddp_bpf_prog_detach(const union bpf_attr *attr);
++//int ddp_bpf_prog_query(const union bpf_attr *attr, union bpf_attr __user *uattr);
++
++#endif /* _BPF_LIRC_H */
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index a18ae82a298a..844d2e7a5b5e 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -59,7 +59,7 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCKOPT, cg_sockopt,
+ #endif
+ #ifdef CONFIG_BPF_LIRC_MODE2
+ BPF_PROG_TYPE(BPF_PROG_TYPE_LIRC_MODE2, lirc_mode2,
+-	      __u32, u32)
++	      void *, void *)
+ #endif
+ #ifdef CONFIG_INET
+ BPF_PROG_TYPE(BPF_PROG_TYPE_SK_REUSEPORT, sk_reuseport,
+@@ -75,6 +75,7 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_LSM, lsm,
+ 	       void *, void *)
+ #endif /* CONFIG_BPF_LSM */
+ #endif
++BPF_PROG_TYPE(BPF_PROG_TYPE_DDP, ddp, __u32, u32)
+ 
+ BPF_MAP_TYPE(BPF_MAP_TYPE_ARRAY, array_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_PERCPU_ARRAY, percpu_array_map_ops)
+@@ -128,4 +129,4 @@ BPF_LINK_TYPE(BPF_LINK_TYPE_CGROUP, cgroup)
+ BPF_LINK_TYPE(BPF_LINK_TYPE_ITER, iter)
+ #ifdef CONFIG_NET
+ BPF_LINK_TYPE(BPF_LINK_TYPE_NETNS, netns)
+-#endif
++#endif
+\ No newline at end of file
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 19684813faae..e3ed5a93a0c5 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -189,6 +189,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_STRUCT_OPS,
+ 	BPF_PROG_TYPE_EXT,
+ 	BPF_PROG_TYPE_LSM,
++	BPF_PROG_TYPE_DDP
+ };
+ 
+ enum bpf_attach_type {
+@@ -226,6 +227,7 @@ enum bpf_attach_type {
+ 	BPF_CGROUP_INET4_GETSOCKNAME,
+ 	BPF_CGROUP_INET6_GETSOCKNAME,
+ 	BPF_XDP_DEVMAP,
++	BPF_DDP,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 8da159936bab..14ffd2760a15 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -4,6 +4,7 @@
+ #include <linux/bpf.h>
+ #include <linux/bpf_trace.h>
+ #include <linux/bpf_lirc.h>
++#include <linux/bpf_ddp.h>
+ #include <linux/btf.h>
+ #include <linux/syscalls.h>
+ #include <linux/slab.h>
+@@ -2815,6 +2816,8 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
+ 		return BPF_PROG_TYPE_CGROUP_SOCKOPT;
+ 	case BPF_TRACE_ITER:
+ 		return BPF_PROG_TYPE_TRACING;
++	case BPF_DDP:
++		return BPF_PROG_TYPE_DDP;
+ 	default:
+ 		return BPF_PROG_TYPE_UNSPEC;
+ 	}
+@@ -2870,6 +2873,9 @@ static int bpf_prog_attach(const union bpf_attr *attr)
+ 	case BPF_PROG_TYPE_SOCK_OPS:
+ 		ret = cgroup_bpf_prog_attach(attr, ptype, prog);
+ 		break;
++	case BPF_PROG_TYPE_DDP:
++		ret = ddp_bpf_prog_attach(attr, prog);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+@@ -2908,6 +2914,8 @@ static int bpf_prog_detach(const union bpf_attr *attr)
+ 	case BPF_PROG_TYPE_CGROUP_SYSCTL:
+ 	case BPF_PROG_TYPE_SOCK_OPS:
+ 		return cgroup_bpf_prog_detach(attr, ptype);
++	case BPF_PROG_TYPE_DDP:
++		return ddp_bpf_prog_detach(attr);
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 34cde841ab68..96b4415423a7 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -504,6 +504,7 @@ static const char * const reg_type_str[] = {
+ 	[PTR_TO_BTF_ID_OR_NULL]	= "ptr_or_null_",
+ 	[PTR_TO_MEM]		= "mem",
+ 	[PTR_TO_MEM_OR_NULL]	= "mem_or_null",
++	[PTR_TO_DDP_KEYS] = "ddp_keys",
+ };
+ 
+ static char slot_type_char[] = {
+@@ -2161,6 +2162,7 @@ static bool is_spillable_regtype(enum bpf_reg_type type)
+ 	case PTR_TO_XDP_SOCK:
+ 	case PTR_TO_BTF_ID:
+ 	case PTR_TO_BTF_ID_OR_NULL:
++	case PTR_TO_DDP_KEYS:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -2916,6 +2918,9 @@ static int check_ptr_alignment(struct bpf_verifier_env *env,
+ 	case PTR_TO_XDP_SOCK:
+ 		pointer_desc = "xdp_sock ";
+ 		break;
++	case PTR_TO_DDP_KEYS:
++		pointer_desc = "ddp keys ";
++		break;
+ 	default:
+ 		break;
+ 	}
+-- 
+2.25.1
+
