@@ -287,7 +287,13 @@ static struct io_u *fio_ioring_event(struct thread_data *td, int event)
 		else
 			io_u->resid = io_u->xfer_buflen - cqe->res;
 	} else
-		io_u->error = 0;
+		if (cqe->dep != 4)
+		{
+			io_u->error = 0;
+		}
+		else {
+			io_u->error = -EL2HLT;
+		}
 
 	return io_u;
 }
