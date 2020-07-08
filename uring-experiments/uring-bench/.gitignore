@@ -1,0 +1,8 @@
+bench
+benchtry
+onebench
+cleanup
+*.o
+*.data
+*.err
+*.err.gz

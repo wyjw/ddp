@@ -1,0 +1,62 @@
+#!/bin/bash
+
+SCRIPTPATH="$(cd "$(dirname "$0")"; pwd -P)"
+cd $SCRIPTPATH
+
+DEVICES=(sda)
+PROCS=(1 2 4 6 8 10)
+WARMUP=5
+RUNTIME=5
+TS_OVERCOMMITTED=0 # If 1 still pin even if too many procs for cores.
+
+for POLLING in FALSE; do
+  for D in ${DEVICES[@]}; do
+#    DNAME=$(sudo smartctl -a /dev/$D | awk '/Model/ { print $4 }')
+#    if [[ "$DNAME" == "" ]]; then
+#      echo "ERROR: Failed to find specified device $D"
+#      exit -1
+#    fi
+
+    for P in ${PROCS[@]}; do
+      results=$DNAME-$P-$POLLING.data
+      echo "Running $DNAME with $P procs, polling $POLLING"
+      if [[ -f "$results" ]]; then
+        echo $results already exists. Skipping.
+        continue
+      fi
+
+      for i in $(seq 1 $P); do
+        ts="taskset -c $((i - 1))"
+        if [[ $P -gt 6 && "$TS_OVERCOMMITTED" == "0" ]]; then
+          ts=""
+          echo Skipping taskset with $P procs.
+        fi
+
+        poll=""
+        if [[ "$POLLING" == "TRUE" ]]; then
+          poll="-p"
+        fi
+
+        sudo $ts ./bench \
+            -s $RUNTIME \
+            -w $WARMUP \
+            -f /dev/$D \
+            $poll \
+            > $DNAME-$P-$POLLING-$i.data \
+            2> $DNAME-$P-$POLLING-$i.err &
+      done
+
+      wait
+
+      cat ./$DNAME-$P-$POLLING-*.data > $results
+
+      sleep 5
+      if [[ "$POLLING" == "TRUE" ]]; then
+        echo "@reboot $SCRIPTPATH/run-experiments" | crontab -
+        sudo shutdown -r now
+        echo "Script will resume after reboot"
+        exit 0
+      fi
+    done
+  done
+done
