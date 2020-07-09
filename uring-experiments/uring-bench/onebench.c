@@ -250,6 +250,7 @@ void io_bench(
       i++;
       if (i < dep)
       {
+        off = xorshift64() & off_mask & (~0xfff); // O_DIRECT needs block-aligned reads.
         sq_submit_io(&sq, buf, buf_size, off);
       }
       else{
