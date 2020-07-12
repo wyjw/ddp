@@ -73,6 +73,7 @@ ts cq_poll(struct cqring* cq) {
             cqe->res, strerror(cqe->res), cqe->flags, index, cqe->user_data);
   }
   // XXX Do we want some extra check to ensure we don't hit short reads?
+  // printf("Reads of %d", cqe->res);
 
   ts r = cqe->user_data;
 
@@ -97,7 +98,21 @@ void init_io(struct iovec* vec, off_t off, struct io_uring_sqe* sqe) {
   sqe->buf_index = 0;
 }
 
-void sq_submit_io(struct sqring* sq, void* buf, size_t len, off_t off) {
+void init_io_with_data(struct iovec* vec, off_t off, struct io_uring_sqe* sqe, ts data) {
+  sqe->opcode = IORING_OP_READV;
+  sqe->flags = IOSQE_FIXED_FILE;
+  sqe->ioprio = 0;
+  sqe->fd = 0; // See io_uring_register; index into a "registered fd array".
+  sqe->off = off;
+  sqe->addr = (uintptr_t)vec;
+  sqe->len = 1;
+  sqe->rw_flags = 0;
+  sqe->user_data = data; // XXX This isn't right -- should use last deadline?
+  sqe->buf_index = 0;
+}
+
+void sq_submit_io(struct sqring* sq, void* buf, size_t len, off_t off, ts data) {
+  //printf("Data is %d\n", data);
   uint32_t tail = *sq->tail;
   const uint32_t index = tail & *sq->mask;
 
@@ -105,7 +120,7 @@ void sq_submit_io(struct sqring* sq, void* buf, size_t len, off_t off) {
   struct iovec* vec = &sq->vecs[index];
   vec->iov_base = buf;
   vec->iov_len = len;
-  init_io(vec, off, &sq->sqes[index]);
+  init_io_with_data(vec, off, &sq->sqes[index], data + 1);
 
   // Push SQE index into the array and bump tail to kick IO
   sq->array[index] = index;
@@ -240,22 +255,20 @@ void io_bench(
   ts cqe_ts;
 
   size_t off = xorshift64() & off_mask & (~0xfff); // O_DIRECT needs block-aligned reads.
-  int i = 0;
+  //int i = 0;
   ts begin = rdtsc();
-  sq_submit_io(&sq, buf, buf_size, off);
+  sq_submit_io(&sq, buf, buf_size, off, 0);
   while (begin < begin + all_done_ts)
   {
     r = io_uring_enter(ring_fd, 1, 0, IORING_ENTER_GETEVENTS, NULL);
     assert(r != -1);
     cqe_ts = cq_poll(&cq);
-    ts end = rdtsc();
     if (cqe_ts != 0)
     {
-      i++;
-      if (i < dep)
+      if (cqe_ts < dep)
       {
         off = xorshift64() & off_mask & (~0xfff); // O_DIRECT needs block-aligned reads.
-        sq_submit_io(&sq, buf, buf_size, off);
+        sq_submit_io(&sq, buf, buf_size, off, cqe_ts);
       }
       else{
         break;
@@ -369,7 +382,7 @@ int main(int argc, char* argv[]) {
   }
 
   printf("Size of %llu compared to %llu\n", max_off, 128lu * (1 << 30));
-  size_t buf_size = 512;
+  size_t buf_size = 4096;
   uint64_t dep_no = 4;
 
   int opt;
