@@ -386,7 +386,7 @@ int main(int argc, char* argv[]) {
   uint64_t dep_no = 4;
 
   int opt;
-  while ((opt = getopt(argc, argv, "pr:f:w:s:o:b:d:")) != -1) {
+  while ((opt = getopt(argc, argv, "pr:f:w:s:o:b:d:k:")) != -1) {
     switch(opt) {
       case 'f':
         filepath = optarg;
@@ -411,6 +411,9 @@ int main(int argc, char* argv[]) {
         break;
       case 'd':
         dep_no = atol(optarg);
+        break;
+      case 'k':
+        dep_no = 1;
         break;
       case ':':
         fprintf(stderr, "option needs a value\n");
