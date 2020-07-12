@@ -14,6 +14,10 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <linux/fs.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
 
 //#include <linux/io_uring.h>
 
@@ -324,13 +328,47 @@ void io_bench(
   close(ring_fd);
 }
 
+static size_t get_file_size(int fd)
+{
+  struct stat st;
+
+  if (fstat(fd, &st) < 0)
+    return -1;
+  if (S_ISBLK(st.st_mode)) {
+    unsigned long long bytes;
+
+    if (ioctl(fd, BLKGETSIZE64, &bytes) != 0)
+      return -1;
+
+    return bytes;
+  } else if (S_ISREG(st.st_mode)) {
+    return st.st_size;
+  }
+
+  return -1;
+}
+
 int main(int argc, char* argv[]) {
-  const char* filepath = "/dev/nvme0n1";
+  char* filepath = "/dev/nvme0n1";
   bool use_polling = false;
   uint64_t reqs_per_second = 1000;
   uint64_t warmup_seconds = 30;
   uint64_t seconds = 30;
   size_t max_off = 128lu * (1 << 30);
+
+  int fd, flags;
+  struct file *f;
+
+  flags = O_RDONLY;
+  fd = open(filepath, flags);
+  assert(fd != 0);
+
+  if ((max_off = get_file_size(fd)) == -1)
+  {
+    printf("Failed getting size of device.\n");
+  }
+
+  printf("Size of %llu compared to %llu\n", max_off, 128lu * (1 << 30));
   size_t buf_size = 512;
   uint64_t dep_no = 4;
 
