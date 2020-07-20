@@ -1,0 +1,41 @@
+From 6adb24d2d16f7e163b7b1efb7788a3e1cab4e181 Mon Sep 17 00:00:00 2001
+From: wyjw <yujian.wu1@gmail.com>
+Date: Mon, 13 Jul 2020 07:39:35 +0800
+Subject: [PATCH] first changes to add counter
+
+---
+ block/blk-mq.c         | 3 +++
+ include/linux/blkdev.h | 3 +++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 4f57d27bfa73..b599a5b56fa3 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2074,6 +2074,9 @@ blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ 		return BLK_QC_T_NONE;
+ 	}
+ 
++	rq->alter_count = 0;
++	rq->total_count = 16;
++
+ 	plug = blk_mq_plug(q, bio);
+ 	if (unlikely(is_flush_fua)) {
+ 		/* Bypass scheduler for flush requests */
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 8fd900998b4e..1eb19bfd104b 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -246,6 +246,9 @@ struct request {
+ 	 */
+ 	rq_end_io_fn *end_io;
+ 	void *end_io_data;
++
++	unsigned int alter_count;
++	unsigned int total_count;
+ };
+ 
+ static inline bool blk_op_is_scsi(unsigned int op)
+-- 
+2.25.1
+

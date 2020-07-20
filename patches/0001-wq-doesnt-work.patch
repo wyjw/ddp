@@ -1,0 +1,512 @@
+From 6adb24d2d16f7e163b7b1efb7788a3e1cab4e181 Mon Sep 17 00:00:00 2001
+From: wyjw <yujian.wu1@gmail.com>
+Date: Mon, 13 Jul 2020 07:39:35 +0800
+Subject: [PATCH 1/4] first changes to add counter
+
+---
+ block/blk-mq.c         | 3 +++
+ include/linux/blkdev.h | 3 +++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 4f57d27bfa73..b599a5b56fa3 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2074,6 +2074,9 @@ blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ 		return BLK_QC_T_NONE;
+ 	}
+ 
++	rq->alter_count = 0;
++	rq->total_count = 16;
++
+ 	plug = blk_mq_plug(q, bio);
+ 	if (unlikely(is_flush_fua)) {
+ 		/* Bypass scheduler for flush requests */
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 8fd900998b4e..1eb19bfd104b 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -246,6 +246,9 @@ struct request {
+ 	 */
+ 	rq_end_io_fn *end_io;
+ 	void *end_io_data;
++
++	unsigned int alter_count;
++	unsigned int total_count;
+ };
+ 
+ static inline bool blk_op_is_scsi(unsigned int op)
+-- 
+2.25.1
+
+
+From bd937efe887eb74028d0e8f0c61afc9e02d137c5 Mon Sep 17 00:00:00 2001
+From: wyjw <yujian.wu1@gmail.com>
+Date: Mon, 13 Jul 2020 20:01:37 +0800
+Subject: [PATCH 2/4] first attempt at close-to mechanism
+
+---
+ block/blk-mq.c           |  2 +-
+ drivers/nvme/host/core.c |  7 ++++
+ drivers/nvme/host/pci.c  | 84 +++++++++++++++++++++++++++++++++-------
+ include/linux/blkdev.h   |  1 +
+ 4 files changed, 79 insertions(+), 15 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index b599a5b56fa3..a6ca258a5c06 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2075,7 +2075,7 @@ blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ 	}
+ 
+ 	rq->alter_count = 0;
+-	rq->total_count = 16;
++	rq->total_count = 4;
+ 
+ 	plug = blk_mq_plug(q, bio);
+ 	if (unlikely(is_flush_fua)) {
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index c2c5bc4fb702..5da40f062c5d 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -772,6 +772,13 @@ blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
+ 	}
+ 
+ 	cmd->common.command_id = req->tag;
++
++	// alter
++	if (req->alter_count == 0)
++	{
++		req->first_command_id = cmd->common.command_id;
++	}
++
+ 	trace_nvme_setup_cmd(req, cmd);
+ 	return ret;
+ }
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index e2bacd369a88..4b91020c5101 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -900,19 +900,6 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	return ret;
+ }
+ 
+-static void nvme_pci_complete_rq(struct request *req)
+-{
+-	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+-	struct nvme_dev *dev = iod->nvmeq->dev;
+-
+-	if (blk_integrity_rq(req))
+-		dma_unmap_page(dev->dev, iod->meta_dma,
+-			       rq_integrity_vec(req)->bv_len, rq_data_dir(req));
+-	if (blk_rq_nr_phys_segments(req))
+-		nvme_unmap_data(dev, req);
+-	nvme_complete_rq(req);
+-}
+-
+ /* We read the CQE phase first to check if the rest of the entry is valid */
+ static inline bool nvme_cqe_pending(struct nvme_queue *nvmeq)
+ {
+@@ -963,7 +950,46 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 
+ 	req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), cqe->command_id);
+ 	trace_nvme_sq(req, cqe->sq_head, nvmeq->sq_tail);
+-	nvme_end_request(req, cqe->status, cqe->result);
++
++	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++	//struct nvme_queue *nvmeq = iod->nvmeq;
++	struct nvme_ns *ns = req->q->queuedata;
++	struct nvme_dev *dev = iod->nvmeq->dev;
++	struct nvme_command cmnd;
++	blk_status_t ret;
++	
++	if (req->alter_count < req->total_count)
++	{
++		req->alter_count += 1;
++		// alter
++		ret = nvme_setup_cmd(ns, req, &cmnd);
++		if (ret)
++		{
++			printk(KERN_ERR "submit error\n");
++		}
++		//printk(KERN_ERR "Got here 2\n");x
++		if (blk_rq_nr_phys_segments(req)) {
++			ret = nvme_map_data(dev, req, &cmnd);
++			if (ret)
++			{
++				printk(KERN_ERR "mapping error\n");
++			}
++		}
++		//printk(KERN_ERR "Got here 3\n");
++		if (blk_integrity_rq(req)) {
++			ret = nvme_map_metadata(dev, req, &cmnd);
++			if (ret)
++			{
++				printk(KERN_ERR "meta error\n");
++			}
++		}
++		nvme_submit_cmd(nvmeq, &cmnd, true);
++	}
++	else
++	{
++		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
++		nvme_end_request(req, cqe->status, cqe->result);
++	}
+ }
+ 
+ static inline void nvme_update_cq_head(struct nvme_queue *nvmeq)
+@@ -1038,6 +1064,20 @@ static void nvme_poll_irqdisable(struct nvme_queue *nvmeq)
+ 	enable_irq(pci_irq_vector(pdev, nvmeq->cq_vector));
+ }
+ 
++static int nvme_poll_queue(struct nvme_queue *nvmeq)
++{
++	bool found;
++
++	if (!nvme_cqe_pending(nvmeq))
++		return 0;
++
++	spin_lock(&nvmeq->cq_poll_lock);
++	found = nvme_process_cq(nvmeq);
++	spin_unlock(&nvmeq->cq_poll_lock);
++
++	return found;
++}
++
+ static int nvme_poll(struct blk_mq_hw_ctx *hctx)
+ {
+ 	struct nvme_queue *nvmeq = hctx->driver_data;
+@@ -1065,6 +1105,22 @@ static void nvme_pci_submit_async_event(struct nvme_ctrl *ctrl)
+ 	nvme_submit_cmd(nvmeq, &c, true);
+ }
+ 
++static void nvme_pci_complete_rq(struct request *req)
++{
++	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++	struct nvme_queue *nvmeq = iod->nvmeq;
++	struct nvme_ns *ns = req->q->queuedata;
++	struct nvme_dev *dev = iod->nvmeq->dev;
++
++	if (blk_integrity_rq(req))
++		dma_unmap_page(dev->dev, iod->meta_dma,
++			       rq_integrity_vec(req)->bv_len, rq_data_dir(req));
++	if (blk_rq_nr_phys_segments(req))
++		nvme_unmap_data(dev, req);
++
++	nvme_complete_rq(req);
++}
++
+ static int adapter_delete_queue(struct nvme_dev *dev, u8 opcode, u16 id)
+ {
+ 	struct nvme_command c;
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 1eb19bfd104b..410ee50ae268 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -249,6 +249,7 @@ struct request {
+ 
+ 	unsigned int alter_count;
+ 	unsigned int total_count;
++	__u16 first_command_id;
+ };
+ 
+ static inline bool blk_op_is_scsi(unsigned int op)
+-- 
+2.25.1
+
+
+From 479424011c55c4d5a9bee99ed84512bc1fccebfd Mon Sep 17 00:00:00 2001
+From: wyjw <yujian.wu1@gmail.com>
+Date: Mon, 20 Jul 2020 17:07:01 +0800
+Subject: [PATCH 3/4] more work done maybe?
+
+---
+ block/blk-mq.c          |  2 +-
+ drivers/nvme/host/pci.c | 22 ++++++++++++++++++++--
+ 2 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index a6ca258a5c06..4504f44f9daa 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2075,7 +2075,7 @@ blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ 	}
+ 
+ 	rq->alter_count = 0;
+-	rq->total_count = 4;
++	rq->total_count = 32;
+ 
+ 	plug = blk_mq_plug(q, bio);
+ 	if (unlikely(is_flush_fua)) {
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 4b91020c5101..50447f02a101 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -466,6 +466,7 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq)
+  * @cmd: The command to send
+  * @write_sq: whether to write to the SQ doorbell
+  */
++/*
+ static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+ 			    bool write_sq)
+ {
+@@ -478,6 +479,22 @@ static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+ 		nvme_write_sq_db(nvmeq);
+ 	spin_unlock(&nvmeq->sq_lock);
+ }
++*/
++
++static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
++			    bool write_sq)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&nvmeq->sq_lock, flags);
++	memcpy(nvmeq->sq_cmds + (nvmeq->sq_tail << nvmeq->sqes),
++	       cmd, sizeof(*cmd));
++	if (++nvmeq->sq_tail == nvmeq->q_depth)
++		nvmeq->sq_tail = 0;
++	if (write_sq)
++		nvme_write_sq_db(nvmeq);
++	spin_unlock_irqrestore(&nvmeq->sq_lock, flags);
++}
+ 
+ static void nvme_commit_rqs(struct blk_mq_hw_ctx *hctx)
+ {
+@@ -967,7 +984,6 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 		{
+ 			printk(KERN_ERR "submit error\n");
+ 		}
+-		//printk(KERN_ERR "Got here 2\n");x
+ 		if (blk_rq_nr_phys_segments(req)) {
+ 			ret = nvme_map_data(dev, req, &cmnd);
+ 			if (ret)
+@@ -975,7 +991,7 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 				printk(KERN_ERR "mapping error\n");
+ 			}
+ 		}
+-		//printk(KERN_ERR "Got here 3\n");
++		/*
+ 		if (blk_integrity_rq(req)) {
+ 			ret = nvme_map_metadata(dev, req, &cmnd);
+ 			if (ret)
+@@ -983,6 +999,7 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 				printk(KERN_ERR "meta error\n");
+ 			}
+ 		}
++		*/
+ 		nvme_submit_cmd(nvmeq, &cmnd, true);
+ 	}
+ 	else
+@@ -990,6 +1007,7 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
+ 		nvme_end_request(req, cqe->status, cqe->result);
+ 	}
++	
+ }
+ 
+ static inline void nvme_update_cq_head(struct nvme_queue *nvmeq)
+-- 
+2.25.1
+
+
+From bfbf86519d185ee1132fd81a26ee4bd742438f37 Mon Sep 17 00:00:00 2001
+From: wyjw <yujian.wu1@gmail.com>
+Date: Mon, 20 Jul 2020 20:35:14 +0800
+Subject: [PATCH 4/4] changes by using wq
+
+---
+ drivers/nvme/host/core.c |  1 +
+ drivers/nvme/host/nvme.h |  3 ++
+ drivers/nvme/host/pci.c  | 64 ++++++++++++++++++++++++++++++++++++----
+ 3 files changed, 62 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 5da40f062c5d..fe2868f283a9 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -778,6 +778,7 @@ blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
+ 	{
+ 		req->first_command_id = cmd->common.command_id;
+ 	}
++	INIT_LIST_HEAD(&(nvme_req(req))->resubmit_list);
+ 
+ 	trace_nvme_setup_cmd(req, cmd);
+ 	return ret;
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index c0f4226d3299..8553dc867121 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -142,8 +142,11 @@ struct nvme_request {
+ 	u8			flags;
+ 	u16			status;
+ 	struct nvme_ctrl	*ctrl;
++	struct list_head resubmit_list;
+ };
+ 
++
++
+ /*
+  * Mark a bio as coming in through the mpath node.
+  */
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 50447f02a101..4a5bb524e3d5 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -94,6 +94,7 @@ static unsigned int poll_queues;
+ module_param_cb(poll_queues, &io_queue_count_ops, &poll_queues, 0644);
+ MODULE_PARM_DESC(poll_queues, "Number of queues to use for polled IO.");
+ 
++struct workqueue_struct *nvme_resubmit_wq;
+ struct nvme_dev;
+ struct nvme_queue;
+ 
+@@ -206,6 +207,9 @@ struct nvme_queue {
+ 	u32 *dbbuf_sq_ei;
+ 	u32 *dbbuf_cq_ei;
+ 	struct completion delete_done;
++	struct list_head resubmit_list;
++	spinlock_t resubmit_lock;
++	struct work_struct resubmit_work;
+ };
+ 
+ /*
+@@ -466,10 +470,11 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq)
+  * @cmd: The command to send
+  * @write_sq: whether to write to the SQ doorbell
+  */
+-/*
++
+ static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+ 			    bool write_sq)
+ {
++	printk(KERN_ERR "COMMAND SUBMITTED!\n");
+ 	spin_lock(&nvmeq->sq_lock);
+ 	memcpy(nvmeq->sq_cmds + (nvmeq->sq_tail << nvmeq->sqes),
+ 	       cmd, sizeof(*cmd));
+@@ -479,8 +484,8 @@ static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+ 		nvme_write_sq_db(nvmeq);
+ 	spin_unlock(&nvmeq->sq_lock);
+ }
+-*/
+ 
++/*
+ static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+ 			    bool write_sq)
+ {
+@@ -495,6 +500,7 @@ static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+ 		nvme_write_sq_db(nvmeq);
+ 	spin_unlock_irqrestore(&nvmeq->sq_lock, flags);
+ }
++*/
+ 
+ static void nvme_commit_rqs(struct blk_mq_hw_ctx *hctx)
+ {
+@@ -941,6 +947,39 @@ static inline struct blk_mq_tags *nvme_queue_tagset(struct nvme_queue *nvmeq)
+ 	return nvmeq->dev->tagset.tags[nvmeq->qid - 1];
+ }
+ 
++static void nvme_resubmit_work(struct work_struct *work)
++{
++	struct nvme_queue *q = container_of(work, struct nvme_queue, resubmit_work);
++	LIST_HEAD(cmd_list);
++	struct nvme_request *rs, *next;
++
++	spin_lock_irq(&q->resubmit_lock);
++	list_splice_init(&q->resubmit_list, &cmd_list);
++	spin_unlock_irq(&q->resubmit_lock);
++
++	list_for_each_entry_safe(rs, next, &cmd_list, resubmit_list) {
++		list_del_init(&rs->resubmit_list);
++		nvme_submit_cmd(q, rs->cmd, true);
++	}
++}
++
++void nvme_kick_resubmit_list(struct nvme_queue *q)
++{
++	queue_work(nvme_resubmit_wq, &q->resubmit_work);
++}
++
++void nvme_add_to_resubmit_list(struct nvme_queue *nvmeq, struct request *rq)
++{
++	unsigned long flags;
++	struct nvme_request *nvme_rq = nvme_req(rq);
++
++	spin_lock_irqsave(&nvmeq->resubmit_lock, flags);
++	list_add(&nvme_rq->resubmit_list, &nvmeq->resubmit_list);
++	spin_unlock_irqrestore(&nvmeq->resubmit_lock, flags);
++
++	nvme_kick_resubmit_list(nvmeq);
++}
++
+ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ {
+ 	struct nvme_completion *cqe = &nvmeq->cqes[idx];
+@@ -972,25 +1011,26 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 	//struct nvme_queue *nvmeq = iod->nvmeq;
+ 	struct nvme_ns *ns = req->q->queuedata;
+ 	struct nvme_dev *dev = iod->nvmeq->dev;
+-	struct nvme_command cmnd;
++	struct nvme_command *cmnd = kmalloc(sizeof(struct nvme_command), GFP_ATOMIC);
+ 	blk_status_t ret;
+ 	
+ 	if (req->alter_count < req->total_count)
+ 	{
+ 		req->alter_count += 1;
+ 		// alter
+-		ret = nvme_setup_cmd(ns, req, &cmnd);
++		ret = nvme_setup_cmd(ns, req, cmnd);
+ 		if (ret)
+ 		{
+ 			printk(KERN_ERR "submit error\n");
+ 		}
+ 		if (blk_rq_nr_phys_segments(req)) {
+-			ret = nvme_map_data(dev, req, &cmnd);
++			ret = nvme_map_data(dev, req, cmnd);
+ 			if (ret)
+ 			{
+ 				printk(KERN_ERR "mapping error\n");
+ 			}
+ 		}
++		nvme_req(req)->cmd = cmnd;
+ 		/*
+ 		if (blk_integrity_rq(req)) {
+ 			ret = nvme_map_metadata(dev, req, &cmnd);
+@@ -1000,7 +1040,9 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 			}
+ 		}
+ 		*/
+-		nvme_submit_cmd(nvmeq, &cmnd, true);
++		//nvme_submit_cmd(nvmeq, &cmnd, true);
++
++		nvme_add_to_resubmit_list(nvmeq, req);
+ 	}
+ 	else
+ 	{
+@@ -1576,6 +1618,10 @@ static void nvme_init_queue(struct nvme_queue *nvmeq, u16 qid)
+ 	memset((void *)nvmeq->cqes, 0, CQ_SIZE(nvmeq));
+ 	nvme_dbbuf_init(dev, nvmeq, qid);
+ 	dev->online_queues++;
++
++	INIT_WORK(&nvmeq->resubmit_work, nvme_resubmit_work);
++	INIT_LIST_HEAD(&nvmeq->resubmit_list);
++	spin_lock_init(&nvmeq->resubmit_lock);
+ 	wmb(); /* ensure the first interrupt sees the initialization */
+ }
+ 
+@@ -3228,6 +3274,12 @@ static int __init nvme_init(void)
+ 	BUILD_BUG_ON(sizeof(struct nvme_delete_queue) != 64);
+ 	BUILD_BUG_ON(IRQ_AFFINITY_MAX_SETS < 2);
+ 
++	// alter
++	nvme_resubmit_wq = alloc_workqueue("nvme-resubmit-wq",
++			WQ_UNBOUND | WQ_MEM_RECLAIM | WQ_SYSFS | WQ_HIGHPRI, 0);
++	if (!nvme_resubmit_wq)
++		printk(KERN_ERR "Resubmit workqueue cannot be made.\n");
++
+ 	return pci_register_driver(&nvme_driver);
+ }
+ 
+-- 
+2.25.1
+
