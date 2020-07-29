@@ -14,6 +14,10 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <linux/fs.h>
+#include <stdint.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
 
 //#include <linux/io_uring.h>
 
@@ -23,6 +27,8 @@
 
 #include "cycles.h"
 #include "rand.h"
+
+#define DEPNO 8
 
 struct sqring {
   uint32_t* head;
@@ -67,7 +73,6 @@ ts cq_poll(struct cqring* cq) {
             cqe->res, strerror(cqe->res), cqe->flags, index, cqe->user_data);
   }
   // XXX Do we want some extra check to ensure we don't hit short reads?
-
   ts r = cqe->user_data;
 
   head++;
@@ -91,7 +96,20 @@ void init_io(struct iovec* vec, off_t off, struct io_uring_sqe* sqe) {
   sqe->buf_index = 0;
 }
 
-void sq_submit_io(struct sqring* sq, void* buf, size_t len, off_t off) {
+void init_io_with_data(struct iovec* vec, off_t off, struct io_uring_sqe* sqe, ts data) {
+  sqe->opcode = IORING_OP_READV;
+  sqe->flags = IOSQE_FIXED_FILE;
+  sqe->ioprio = 0;
+  sqe->fd = 0; // See io_uring_register; index into a "registered fd array".
+  sqe->off = off;
+  sqe->addr = (uintptr_t)vec;
+  sqe->len = 1;
+  sqe->rw_flags = 0;
+  sqe->user_data = data; // XXX This isn't right -- should use last deadline?
+  sqe->buf_index = 0;
+}
+
+void sq_submit_io(struct sqring* sq, void* buf, size_t len, off_t off, ts data) {
   uint32_t tail = *sq->tail;
   const uint32_t index = tail & *sq->mask;
 
@@ -99,7 +117,7 @@ void sq_submit_io(struct sqring* sq, void* buf, size_t len, off_t off) {
   struct iovec* vec = &sq->vecs[index];
   vec->iov_base = buf;
   vec->iov_len = len;
-  init_io(vec, off, &sq->sqes[index]);
+  init_io_with_data(vec, off, &sq->sqes[index], data + 1);
 
   // Push SQE index into the array and bump tail to kick IO
   sq->array[index] = index;
@@ -150,6 +168,11 @@ void cq_setup(int ring_fd, const struct io_uring_params *p, struct cqring* cq) {
 
 const size_t MAX_SAMPLES = 1024 * 1024;
 
+uint64_t convert(uint64_t ns)
+{
+  return ns * 1000000000 / cycles_per_second;
+}
+
 void io_bench(
     const char* filepath,
     uint64_t reqs_per_second,
@@ -157,7 +180,8 @@ void io_bench(
     size_t max_off,
     uint64_t seconds,
     uint64_t warmup_seconds,
-    bool use_polling)
+    bool use_polling,
+    int dep)
 {
   uint64_t* samples = mmap(NULL, MAX_SAMPLES * sizeof(uint64_t),
                            PROT_READ | PROT_WRITE,
@@ -187,6 +211,7 @@ void io_bench(
 
   struct io_uring_params params;
   memset(&params, 0, sizeof(params));
+  params.flags = IORING_SETUP_IOPOLL;
   if (use_polling) {
     params.flags = IORING_SETUP_IOPOLL | IORING_SETUP_SQPOLL;
     //params->sq_idle_thread = 1000; // kthread poller idle time in ms
@@ -213,21 +238,8 @@ void io_bench(
   int r = io_uring_register(ring_fd, IORING_REGISTER_FILES, &fd, 1);
   assert(r != -1);
 
-  // Begin benchmarking.
-
-  uint32_t sqes = *sq.entries;
-  uint32_t in_flight = 0;
-
-  const uint64_t dump_period_ns = 1000000000;
-  const uint64_t warn_margin_ns = 1000;
-  uint64_t ns_between_reqs = (uint64_t)(1e9 / reqs_per_second);
-  uint64_t submitted = 0;
-  uint64_t completed = 0;
-  uint64_t last_completed = 0;
-  assert(max_off * (max_off - 1));
-  size_t off_mask = max_off - 1;
-
-  ts begin = rdtsc();
+  
+  /*
   ts start = begin;
   ts deadline = begin + ns_between_reqs;
   ts last_dump = begin;
@@ -235,7 +247,46 @@ void io_bench(
   ts warmup_done_ts = (warmup_seconds * cycles_per_second) + begin;
   ts all_done_ts = (seconds * cycles_per_second) + warmup_done_ts;
   bool warmup = true;
+  */
+  size_t off_mask = max_off - 1;
+  ts all_done_ts = (seconds * cycles_per_second);
+  ts cqe_ts;
 
+  size_t off = xorshift64() & off_mask & (~0xfff); // O_DIRECT needs block-aligned reads.
+  //int i = 0;
+  ts count = 0;
+  ts begin = rdtsc();
+  sq_submit_io(&sq, buf, buf_size, off, 0);
+  count++;
+  while (begin < begin + all_done_ts)
+  {
+    r = io_uring_enter(ring_fd, count, 0, IORING_ENTER_GETEVENTS, NULL);
+    if (r != -1)
+    {
+      count = 0;
+    }
+    cqe_ts = cq_poll(&cq);
+    //printf("%d\n", cqe_ts);
+    if (cqe_ts != 0)
+    {
+      //printf("Total time: %lu\n", convert(rdtsc() - begin));
+      if (cqe_ts < dep)
+      {
+        off = cqe_ts * 10 & off_mask & (~0xfff); 
+        //off = xorshift64() & off_mask & (~0xfff); // O_DIRECT needs block-aligned reads.
+        sq_submit_io(&sq, buf, buf_size, off, cqe_ts);
+        count++;
+      }
+      else{
+        break;
+      }
+    }
+  }
+  ts end = rdtsc();
+  ts total_time = end - begin;
+  printf("Total time: %lu\n", convert(total_time));
+
+  /*
   while (start < all_done_ts) {
     // Reap ready CQEs eagerly because to attach end timestamps to them.
     ts cqe_ts;
@@ -292,22 +343,57 @@ void io_bench(
     uint64_t ns = cycles * 1000000000 / cycles_per_second;
     printf("%lu\n", ns);
   }
-
+  */
   close(fd);
   close(ring_fd);
 }
 
+static size_t get_file_size(int fd)
+{
+  struct stat st;
+
+  if (fstat(fd, &st) < 0)
+    return -1;
+  if (S_ISBLK(st.st_mode)) {
+    unsigned long long bytes;
+
+    if (ioctl(fd, BLKGETSIZE64, &bytes) != 0)
+      return -1;
+
+    return bytes;
+  } else if (S_ISREG(st.st_mode)) {
+    return st.st_size;
+  }
+
+  return -1;
+}
+
 int main(int argc, char* argv[]) {
-  const char* filepath = "/dev/sda";
+  char* filepath = "/dev/nvme0n1";
   bool use_polling = false;
   uint64_t reqs_per_second = 1000;
   uint64_t warmup_seconds = 30;
   uint64_t seconds = 30;
   size_t max_off = 128lu * (1 << 30);
-  size_t buf_size = 512;
+
+  int fd, flags;
+  struct file *f;
+
+  flags = O_RDONLY;
+  fd = open(filepath, flags);
+  assert(fd != 0);
+
+  if ((max_off = get_file_size(fd)) == -1)
+  {
+    printf("Failed getting size of device.\n");
+  }
+
+  printf("Size of %llu compared to %llu\n", max_off, 128lu * (1 << 30));
+  size_t buf_size = 4096;
+  uint64_t dep_no = 4;
 
   int opt;
-  while ((opt = getopt(argc, argv, "pr:f:w:s:o:b:")) != -1) {
+  while ((opt = getopt(argc, argv, "pr:f:w:s:o:b:d:k:")) != -1) {
     switch(opt) {
       case 'f':
         filepath = optarg;
@@ -330,6 +416,12 @@ int main(int argc, char* argv[]) {
       case 'o':
         max_off = atol(optarg);
         break;
+      case 'd':
+        dep_no = atol(optarg);
+        break;
+      case 'k':
+        dep_no = 1;
+        break;
       case ':':
         fprintf(stderr, "option needs a value\n");
         break;
@@ -350,11 +442,10 @@ int main(int argc, char* argv[]) {
   fprintf(stderr, "# max_off %lu\n", max_off);
   fprintf(stderr, "# seconds %lu\n", seconds);
   fprintf(stderr, "# warmup_seconds %lu\n", warmup_seconds);
-
+  fprintf(stderr, "# depno %lu\n", dep_no);
   bool r = cycles_init();
   assert(r);
 
-  io_bench(filepath, reqs_per_second, buf_size, max_off, seconds, warmup_seconds, use_polling);
-
+  io_bench(filepath, reqs_per_second, buf_size, max_off, seconds, warmup_seconds, use_polling, dep_no);
   return 0;
 }
