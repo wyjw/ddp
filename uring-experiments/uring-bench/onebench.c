@@ -362,7 +362,7 @@ static size_t get_file_size(int fd)
 }
 
 int main(int argc, char* argv[]) {
-  char* filepath = "/dev/nvme0n1";
+  char* filepath = "/dev/treenvme0";
   bool use_polling = false;
   uint64_t reqs_per_second = 1000;
   uint64_t warmup_seconds = 30;
