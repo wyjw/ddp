@@ -1,0 +1,944 @@
+diff --git a/block/blk-exec.c b/block/blk-exec.c
+index e20a852ae432..0d9d6a2e74a5 100644
+--- a/block/blk-exec.c
++++ b/block/blk-exec.c
+@@ -27,7 +27,8 @@ static void blk_end_sync_rq(struct request *rq, blk_status_t error)
+ 	 * complete last, if this is a stack request the process (and thus
+ 	 * the rq pointer) could be invalid right after this complete()
+ 	 */
+-	complete(waiting);
++	if (waiting != NULL)
++		complete(waiting);
+ }
+ 
+ /**
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index a7785df2c944..784a1996165f 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2016,6 +2016,10 @@ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+ 
+ 	blk_mq_bio_to_request(rq, bio, nr_segs);
+ 
++	// alter
++	rq->alter_count = 0;
++	rq->total_count = 1;
++
+ 	plug = blk_mq_plug(q, bio);
+ 	if (unlikely(is_flush_fua)) {
+ 		/* Bypass scheduler for flush requests */
+diff --git a/drivers/nvme/host/Kconfig b/drivers/nvme/host/Kconfig
+index 9c17ed32be64..5ed7533247ef 100644
+--- a/drivers/nvme/host/Kconfig
++++ b/drivers/nvme/host/Kconfig
+@@ -24,6 +24,12 @@ config NVME_MULTIPATH
+ 	   /dev/nvmeXnY device will show up for each NVMe namespaces,
+ 	   even if it is accessible through multiple controllers.
+ 
++config NVME_TREENVME
++	bool "treeNvme support"
++	depends on PCI && BLOCK && NVME_CORE
++	---help---
++	   This option allows for treenvme.
++
+ config NVME_HWMON
+ 	bool "NVMe hardware monitoring"
+ 	depends on (NVME_CORE=y && HWMON=y) || (NVME_CORE=m && HWMON)
+diff --git a/drivers/nvme/host/Makefile b/drivers/nvme/host/Makefile
+index fc7b26be692d..b880c4815a2e 100644
+--- a/drivers/nvme/host/Makefile
++++ b/drivers/nvme/host/Makefile
+@@ -8,6 +8,7 @@ obj-$(CONFIG_NVME_FABRICS)		+= nvme-fabrics.o
+ obj-$(CONFIG_NVME_RDMA)			+= nvme-rdma.o
+ obj-$(CONFIG_NVME_FC)			+= nvme-fc.o
+ obj-$(CONFIG_NVME_TCP)			+= nvme-tcp.o
++obj-$(CONFIG_NVME_TREENVME)		+= nvme-treenvme.o
+ 
+ nvme-core-y				:= core.o
+ nvme-core-$(CONFIG_TRACING)		+= trace.o
+@@ -15,9 +16,12 @@ nvme-core-$(CONFIG_NVME_MULTIPATH)	+= multipath.o
+ nvme-core-$(CONFIG_NVM)			+= lightnvm.o
+ nvme-core-$(CONFIG_FAULT_INJECTION_DEBUG_FS)	+= fault_inject.o
+ nvme-core-$(CONFIG_NVME_HWMON)		+= hwmon.o
++#nvme-core-$(CONFIG_NVME_TREENVME)	+= treenvme.o
+ 
+ nvme-y					+= pci.o
+ 
++nvme-treenvme-y				+= treenvme.o
++
+ nvme-fabrics-y				+= fabrics.o
+ 
+ nvme-rdma-y				+= rdma.o
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index f3c037f5a9ba..c1a3455cef00 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -776,6 +776,13 @@ blk_status_t nvme_setup_cmd(struct nvme_ns *ns, struct request *req,
+ 	}
+ 
+ 	cmd->common.command_id = req->tag;
++
++	// alter
++	if (req)
++	{
++		req->first_command_id = cmd->common.command_id;
++	}
++	
+ 	trace_nvme_setup_cmd(req, cmd);
+ 	return ret;
+ }
+@@ -888,7 +895,7 @@ static void *nvme_add_user_metadata(struct bio *bio, void __user *ubuf,
+ 	return ERR_PTR(ret);
+ }
+ 
+-static int nvme_submit_user_cmd(struct request_queue *q,
++int nvme_submit_user_cmd(struct request_queue *q,
+ 		struct nvme_command *cmd, void __user *ubuffer,
+ 		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
+ 		u32 meta_seed, u64 *result, unsigned timeout)
+@@ -945,6 +952,7 @@ static int nvme_submit_user_cmd(struct request_queue *q,
+ 	blk_mq_free_request(req);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(nvme_submit_user_cmd);
+ 
+ static void nvme_keep_alive_end_io(struct request *rq, blk_status_t status)
+ {
+@@ -1143,7 +1151,7 @@ static int nvme_identify_ns_list(struct nvme_ctrl *dev, unsigned nsid, __le32 *n
+ 				    NVME_IDENTIFY_DATA_SIZE);
+ }
+ 
+-static int nvme_identify_ns(struct nvme_ctrl *ctrl,
++int nvme_identify_ns(struct nvme_ctrl *ctrl,
+ 		unsigned nsid, struct nvme_id_ns **id)
+ {
+ 	struct nvme_command c = { };
+@@ -1166,6 +1174,7 @@ static int nvme_identify_ns(struct nvme_ctrl *ctrl,
+ 
+ 	return error;
+ }
++EXPORT_SYMBOL_GPL(nvme_identify_ns);
+ 
+ static int nvme_features(struct nvme_ctrl *dev, u8 op, unsigned int fid,
+ 		unsigned int dword11, void *buffer, size_t buflen, u32 *result)
+@@ -1870,7 +1879,7 @@ static void nvme_update_disk_info(struct gendisk *disk,
+ 	blk_mq_unfreeze_queue(disk->queue);
+ }
+ 
+-static void __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id)
++void __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id)
+ {
+ 	struct nvme_ns *ns = disk->private_data;
+ 
+@@ -1908,6 +1917,7 @@ static void __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id)
+ 	}
+ #endif
+ }
++EXPORT_SYMBOL_GPL(__nvme_revalidate_disk);
+ 
+ static int nvme_revalidate_disk(struct gendisk *disk)
+ {
+@@ -2115,6 +2125,18 @@ const struct block_device_operations nvme_ns_head_ops = {
+ };
+ #endif /* CONFIG_NVME_MULTIPATH */
+ 
++#ifdef CONFIG_NVME_TREENVME
++const struct block_device_operations treenvme_fops = {
++	.owner		= THIS_MODULE,
++	.open		= nvme_open,
++	.release	= nvme_release,
++	.ioctl		= treenvme_ioctl,
++	.compat_ioctl	= nvme_compat_ioctl,
++	.getgeo		= nvme_getgeo,
++	.pr_ops		= &nvme_pr_ops,
++};
++#endif /* CONFIG_NVME_TREENVME */
++
+ static int nvme_wait_ready(struct nvme_ctrl *ctrl, u64 cap, bool enabled)
+ {
+ 	unsigned long timeout =
+@@ -2236,7 +2258,7 @@ int nvme_shutdown_ctrl(struct nvme_ctrl *ctrl)
+ }
+ EXPORT_SYMBOL_GPL(nvme_shutdown_ctrl);
+ 
+-static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
++void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
+ 		struct request_queue *q)
+ {
+ 	bool vwc = false;
+@@ -2257,6 +2279,7 @@ static void nvme_set_queue_limits(struct nvme_ctrl *ctrl,
+ 		vwc = true;
+ 	blk_queue_write_cache(q, vwc, vwc);
+ }
++EXPORT_SYMBOL_GPL(nvme_set_queue_limits);
+ 
+ static int nvme_configure_timestamp(struct nvme_ctrl *ctrl)
+ {
+@@ -2944,7 +2967,7 @@ int nvme_init_identify(struct nvme_ctrl *ctrl)
+ 	ret = nvme_configure_apst(ctrl);
+ 	if (ret < 0)
+ 		return ret;
+-	
++
+ 	ret = nvme_configure_timestamp(ctrl);
+ 	if (ret < 0)
+ 		return ret;
+@@ -3409,6 +3432,69 @@ static int __nvme_check_ids(struct nvme_subsystem *subsys,
+ 	return 0;
+ }
+ 
++/*
++// alter
++static struct treenvme_head *nvme_alloc_treenvme_head(struct nvme_ctrl *ctrl, 
++	unsigned nsid, struct nvme_id_ns *id, 
++	struct nvme_ns_ids *ids)
++{
++	struct treenvme_head *thead;
++	size_t size = sizeof(*thead);
++	int ret = -ENOMEM;
++
++	thead = kzalloc(size, GFP_KERNEL);
++	if (!thead)
++		goto out;
++	thead->subsys = ctrl->subsys;
++	thead->ns_id = nsid;
++	thead->ids = *ids;
++	kref_init(&thead->ref);
++
++	ret = treenvme_alloc_disk(ctrl, thead);
++	if (ret) {
++		dev_err(ctrl->device,
++			"duplicate IDs for nsid %d\n", nsid);
++		goto out_cleanup_srcu;
++	}
++
++	list_add_tail(&thead->entry, &ctrl->subsys->nsheads);
++
++	kref_get(&ctrl->subsys->ref);
++	return thead;
++out_cleanup_srcu:
++	cleanup_srcu_struct(&thead->srcu);
++out_ida_remove:
++	ida_simple_remove(&ctrl->subsys->ns_ida, thead->instance);
++out_free_head:
++	kfree(thead);
++out:
++	if (ret > 0)
++		ret = blk_status_to_errno(nvme_error_status(ret));
++	return ERR_PTR(ret);
++}
++//static int nvme_init_treenvme_head(struct treenvme_ns *tns, unsigned nsid,
++static int nvme_init_treenvme_head(struct nvme_ns *ns, unsigned nsid,
++		struct nvme_id_ns *id)
++{
++	struct nvme_ctrl *ctrl = ns->ctrl;
++	bool is_shared = id->nmic & (1 << 0);
++	struct treenvme_head *thead = NULL;
++	struct nvme_ns_ids ids;
++	int ret = 0;
++
++	mutex_lock(&ctrl->subsys->lock);
++	thead = nvme_alloc_treenvme_head(ctrl, nsid, id, &ids);
++	list_add_tail(&ns->siblings, &thead->list);
++	ns->thead = thead;
++
++out_unlock:
++	mutex_unlock(&ctrl->subsys->lock);
++out:
++	if (ret > 0)
++		ret = blk_status_to_errno(nvme_error_status(ret));
++	return ret;
++}
++*/
+ static struct nvme_ns_head *nvme_alloc_ns_head(struct nvme_ctrl *ctrl,
+ 		unsigned nsid, struct nvme_id_ns *id,
+ 		struct nvme_ns_ids *ids)
+@@ -3561,10 +3647,13 @@ static int nvme_setup_streams_ns(struct nvme_ctrl *ctrl, struct nvme_ns *ns)
+ 	return 0;
+ }
+ 
++// alter
+ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+ {
+ 	struct nvme_ns *ns;
++	struct treenvme_ns *tns;
+ 	struct gendisk *disk;
++	struct gendisk *treedisk;
+ 	struct nvme_id_ns *id;
+ 	char disk_name[DISK_NAME_LEN];
+ 	int node = ctrl->numa_node, flags = GENHD_FL_EXT_DEVT, ret;
+@@ -3587,9 +3676,8 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+ 
+ 	ns->queue->queuedata = ns;
+ 	ns->ctrl = ctrl;
+-
+ 	kref_init(&ns->kref);
+-	ns->lba_shift = 9; /* set to a default value for 512 until disk is validated */
++	ns->lba_shift = 9; 
+ 
+ 	blk_queue_logical_block_size(ns->queue, 1 << ns->lba_shift);
+ 	nvme_set_queue_limits(ctrl, ns->queue);
+@@ -3598,7 +3686,7 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+ 	if (ret)
+ 		goto out_free_queue;
+ 
+-	if (id->ncap == 0)	/* no namespace (legacy quirk) */
++	if (id->ncap == 0)
+ 		goto out_free_id;
+ 
+ 	ret = nvme_init_ns_head(ns, nsid, id);
+@@ -3606,11 +3694,13 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+ 		goto out_free_id;
+ 	nvme_setup_streams_ns(ctrl, ns);
+ 	nvme_set_disk_name(disk_name, ns, ctrl, &flags);
++	//treenvme_set_name(disk_name, ns, ctrl, &flags);
+ 
+ 	disk = alloc_disk_node(0, node);
+ 	if (!disk)
+ 		goto out_unlink_ns;
+ 
++	// alter
+ 	disk->fops = &nvme_fops;
+ 	disk->private_data = ns;
+ 	disk->queue = ns->queue;
+@@ -3628,15 +3718,44 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+ 		}
+ 	}
+ 
+-	down_write(&ctrl->namespaces_rwsem);
+-	list_add_tail(&ns->list, &ctrl->namespaces);
+-	up_write(&ctrl->namespaces_rwsem);
++	nvme_get_ctrl(ctrl);
++	device_add_disk(ctrl->device, ns->disk, nvme_ns_id_attr_groups);
++	nvme_mpath_add_disk(ns, id);
++
++#ifdef CONFIG_NVME_TREENVME
++	/*	
++	// alter_tree
++	printk(KERN_ERR "Got into treenvm creation.\n");
++	ns->tqueue = blk_alloc_queue(treenvme_make_request, ctrl->numa_node);
++	ns->tqueue->queuedata = ns;
++	blk_queue_logical_block_size(ns->tqueue, 1 << ns->lba_shift);
++	nvme_set_queue_limits(ctrl, ns->tqueue);
+ 
++	treenvme_set_name(disk_name, ns, ctrl, &flags);
++	
++	treedisk = alloc_disk_node(0, node);
++	if (!treedisk)
++		goto out_unlink_ns;
++
++	// alter
++	treedisk->fops = &treenvme_fops;
++	treedisk->private_data = ns;
++	treedisk->queue = ns->tqueue;
++	treedisk->flags = flags;
++	memcpy(treedisk->disk_name, disk_name, DISK_NAME_LEN);
++	ns->tdisk = treedisk;
++
++	__nvme_revalidate_disk(treedisk, id);
+ 	nvme_get_ctrl(ctrl);
++	device_add_disk(ctrl->device, ns->tdisk, nvme_ns_id_attr_groups);
++	*/
++	add_treedisk(ctrl, ns, nsid);
++#endif
+ 
+-	device_add_disk(ctrl->device, ns->disk, nvme_ns_id_attr_groups);
++	down_write(&ctrl->namespaces_rwsem);
++	list_add_tail(&ns->list, &ctrl->namespaces);
++	up_write(&ctrl->namespaces_rwsem);
+ 
+-	nvme_mpath_add_disk(ns, id);
+ 	nvme_fault_inject_init(&ns->fault_inject, ns->disk->disk_name);
+ 	kfree(id);
+ 
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 2e04a36296d9..34013a313920 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -38,6 +38,8 @@ extern struct workqueue_struct *nvme_wq;
+ extern struct workqueue_struct *nvme_reset_wq;
+ extern struct workqueue_struct *nvme_delete_wq;
+ 
++//extern struct nvme_queue;
++
+ enum {
+ 	NVME_NS_LBA		= 0,
+ 	NVME_NS_LIGHTNVM	= 1,
+@@ -146,6 +148,8 @@ struct nvme_request {
+  */
+ #define REQ_NVME_MPATH		REQ_DRV
+ 
++#define REQ_TREENVME		REQ_SWAP
++
+ enum {
+ 	NVME_REQ_CANCELLED		= (1 << 0),
+ 	NVME_REQ_USERCMD		= (1 << 1),
+@@ -353,6 +357,8 @@ struct nvme_ns_head {
+ 	struct list_head	entry;
+ 	struct kref		ref;
+ 	int			instance;
++	struct treenvme_ns *tns;
++
+ #ifdef CONFIG_NVME_MULTIPATH
+ 	struct gendisk		*disk;
+ 	struct bio_list		requeue_list;
+@@ -368,7 +374,9 @@ struct nvme_ns {
+ 
+ 	struct nvme_ctrl *ctrl;
+ 	struct request_queue *queue;
++	struct request_queue *tqueue;
+ 	struct gendisk *disk;
++	struct gendisk *tdisk;
+ #ifdef CONFIG_NVME_MULTIPATH
+ 	enum nvme_ana_state ana_state;
+ 	u32 ana_grpid;
+@@ -377,6 +385,59 @@ struct nvme_ns {
+ 	struct nvm_dev *ndev;
+ 	struct kref kref;
+ 	struct nvme_ns_head *head;
++	struct treenvme_head *thead;
++
++	int lba_shift;
++	u16 ms;
++	u16 sgs;
++	u32 sws;
++	bool ext;
++	u8 pi_type;
++	unsigned long flags;
++#define NVME_NS_REMOVING	0
++#define NVME_NS_DEAD     	1
++#define NVME_NS_ANA_PENDING	2
++	u16 noiob;
++
++	struct nvme_fault_inject fault_inject;
++
++};
++
++// alter
++struct treenvme_head {
++	struct list_head	list;
++	struct srcu_struct      srcu;
++	struct nvme_subsystem	*subsys;
++	unsigned		ns_id;
++	struct nvme_ns_ids	ids;
++	struct list_head	entry;
++	struct kref		ref;
++	int			instance;
++	struct gendisk		*disk;
++	struct bio_list		requeue_list;
++	spinlock_t		requeue_lock;
++	struct work_struct	requeue_work;
++	struct mutex		lock;
++#ifdef CONFIG_NVME_TREENVME
++	struct nvme_ns __rcu	*current_path[];
++#endif
++};
++
++struct treenvme_ns {
++	struct list_head list;
++	struct nvme_ctrl *ctrl;
++	struct request_queue *queue;
++	struct gendisk *disk;
++#ifdef CONFIG_NVME_TREENVME
++	enum nvme_ana_state ana_state;
++	u32 ana_grpid;
++#endif
++	struct list_head siblings;
++	struct nvm_dev *ndev;
++	struct kref kref;
++	struct nvme_ns_head *head;
++	// alter
++	struct treenvme_head *thead;
+ 
+ 	int lba_shift;
+ 	u16 ms;
+@@ -540,6 +601,131 @@ int nvme_get_log(struct nvme_ctrl *ctrl, u32 nsid, u8 log_page, u8 lsp,
+ extern const struct attribute_group *nvme_ns_id_attr_groups[];
+ extern const struct block_device_operations nvme_ns_head_ops;
+ 
++// alter -- treenvme
++extern const struct block_device_operations treenvme_fops;
++/*
++ * Represents an NVM Express device.  Each nvme_dev is a PCI function.
++ */
++struct nvme_dev {
++	struct nvme_queue *queues;
++	struct blk_mq_tag_set tagset;
++	struct blk_mq_tag_set admin_tagset;
++	u32 __iomem *dbs;
++	struct device *dev;
++	struct dma_pool *prp_page_pool;
++	struct dma_pool *prp_small_pool;
++	unsigned online_queues;
++	unsigned max_qid;
++	unsigned io_queues[HCTX_MAX_TYPES];
++	unsigned int num_vecs;
++	int q_depth;
++	int io_sqes;
++	u32 db_stride;
++	void __iomem *bar;
++	unsigned long bar_mapped_size;
++	struct work_struct remove_work;
++	struct mutex shutdown_lock;
++	bool subsystem;
++	u64 cmb_size;
++	bool cmb_use_sqes;
++	u32 cmbsz;
++	u32 cmbloc;
++	struct nvme_ctrl ctrl;
++	u32 last_ps;
++
++	mempool_t *iod_mempool;
++
++	/* shadow doorbell buffer support: */
++	u32 *dbbuf_dbs;
++	dma_addr_t dbbuf_dbs_dma_addr;
++	u32 *dbbuf_eis;
++	dma_addr_t dbbuf_eis_dma_addr;
++
++	/* host memory buffer support: */
++	u64 host_mem_size;
++	u32 nr_host_mem_descs;
++	dma_addr_t host_mem_descs_dma;
++	struct nvme_host_mem_buf_desc *host_mem_descs;
++	void **host_mem_desc_bufs;
++};
++/*
++ * An NVM Express queue.  Each device has at least two (one for admin
++ * commands and one for I/O commands).
++ */
++struct nvme_queue {
++	struct nvme_dev *dev;
++	spinlock_t sq_lock;
++	void *sq_cmds;
++	 /* only used for poll queues: */
++	spinlock_t cq_poll_lock ____cacheline_aligned_in_smp;
++	volatile struct nvme_completion *cqes;
++	dma_addr_t sq_dma_addr;
++	dma_addr_t cq_dma_addr;
++	u32 __iomem *q_db;
++	u16 q_depth;
++	u16 cq_vector;
++	u16 sq_tail;
++	u16 last_sq_tail;
++	u16 cq_head;
++	u16 qid;
++	u8 cq_phase;
++	u8 sqes;
++	unsigned long flags;
++#define NVMEQ_ENABLED		0
++#define NVMEQ_SQ_CMB		1
++#define NVMEQ_DELETE_ERROR	2
++#define NVMEQ_POLLED		3
++	u32 *dbbuf_sq_db;
++	u32 *dbbuf_cq_db;
++	u32 *dbbuf_sq_ei;
++	u32 *dbbuf_cq_ei;
++	struct completion delete_done;
++};
++
++/*
++ * The nvme_iod describes the data in an I/O.
++ *
++ * The sg pointer contains the list of PRP/SGL chunk allocations in addition
++ * to the actual struct scatterlist.
++ */
++struct nvme_iod {
++	struct nvme_request req;
++	struct nvme_queue *nvmeq;
++	bool use_sgl;
++       	int aborted;
++	int npages;		/* In the PRP list. 0 means small pool in use */
++	int nents;		/* Used in scatterlist */
++	dma_addr_t first_dma;
++	unsigned int dma_len;	/* length of single DMA segment mapping */
++	dma_addr_t meta_dma;
++	struct scatterlist *sg;
++};
++void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd, bool write_sq);
++blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req, struct nvme_command *cmnd);
++blk_status_t nvme_map_metadata(struct nvme_dev *dev, struct request *req, struct nvme_command *cmnd);
++extern const struct block_device_operations treenvme_head_ops;
++//void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid);
++int nvme_identify_ns(struct nvme_ctrl *ctrl, unsigned nsid, struct nvme_id_ns **id);    
++void nvme_set_queue_limits(struct nvme_ctrl *ctrl, struct request_queue *q);
++void __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id); 
++int nvme_submit_user_cmd(struct request_queue *q, struct nvme_command *cmd, void __user *ubuffer, unsigned bufflen, void __user *meta_buffer, unsigned meta_len, u32 meta_seed, u64 *result, unsigned timeout);
++
++#ifdef CONFIG_NVME_TREENVME
++void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid);
++void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags);
++int treenvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg);
++void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struct nvme_completion *cqe);
++#else
++/*
++void add_treedisk(struct nvme_ctrl *ctrl, struct nvme_ns *ns, unsigned nsid){
++}
++void treenvme_set_name(char *disk_name, struct nvme_ns *ns, struct nvme_ctrl *ctrl, int *flags){}
++int treenvme_ioctl(struct block_device *bdev, fmode_t mode, unsigned int cmd, unsigned long arg){}
++inline void nvme_backpath(struct nvme_queue *nvmeq, u16 idx, struct request *req, struct nvme_completion *cqe){
++}*/
++#endif /* CONFIG_NVME_TREENVME */
++
++
+ #ifdef CONFIG_NVME_MULTIPATH
+ static inline bool nvme_ctrl_use_ana(struct nvme_ctrl *ctrl)
+ {
+@@ -562,6 +748,9 @@ void nvme_mpath_stop(struct nvme_ctrl *ctrl);
+ bool nvme_mpath_clear_current_path(struct nvme_ns *ns);
+ void nvme_mpath_clear_ctrl_paths(struct nvme_ctrl *ctrl);
+ struct nvme_ns *nvme_find_path(struct nvme_ns_head *head);
++int treenvme_alloc_disk(struct nvme_ctrl *ctrl,struct treenvme_head *head);
++blk_qc_t treenvme_make_request(struct request_queue *q, struct bio *bio);
++
+ 
+ static inline void nvme_mpath_check_last_path(struct nvme_ns *ns)
+ {
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index cc46e250fcac..5541d188a655 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -78,58 +78,16 @@ static unsigned int poll_queues;
+ module_param(poll_queues, uint, 0644);
+ MODULE_PARM_DESC(poll_queues, "Number of queues to use for polled IO.");
+ 
+-struct nvme_dev;
+-struct nvme_queue;
++static unsigned int dep_depth;
++module_param(dep_depth, uint, 0644);
++MODULE_PARM_DESC(dep_depth, "depth of dependencies."); 
++
++//struct nvme_dev;
++//struct nvme_queue;
+ 
+ static void nvme_dev_disable(struct nvme_dev *dev, bool shutdown);
+ static bool __nvme_disable_io_queues(struct nvme_dev *dev, u8 opcode);
+ 
+-/*
+- * Represents an NVM Express device.  Each nvme_dev is a PCI function.
+- */
+-struct nvme_dev {
+-	struct nvme_queue *queues;
+-	struct blk_mq_tag_set tagset;
+-	struct blk_mq_tag_set admin_tagset;
+-	u32 __iomem *dbs;
+-	struct device *dev;
+-	struct dma_pool *prp_page_pool;
+-	struct dma_pool *prp_small_pool;
+-	unsigned online_queues;
+-	unsigned max_qid;
+-	unsigned io_queues[HCTX_MAX_TYPES];
+-	unsigned int num_vecs;
+-	int q_depth;
+-	int io_sqes;
+-	u32 db_stride;
+-	void __iomem *bar;
+-	unsigned long bar_mapped_size;
+-	struct work_struct remove_work;
+-	struct mutex shutdown_lock;
+-	bool subsystem;
+-	u64 cmb_size;
+-	bool cmb_use_sqes;
+-	u32 cmbsz;
+-	u32 cmbloc;
+-	struct nvme_ctrl ctrl;
+-	u32 last_ps;
+-
+-	mempool_t *iod_mempool;
+-
+-	/* shadow doorbell buffer support: */
+-	u32 *dbbuf_dbs;
+-	dma_addr_t dbbuf_dbs_dma_addr;
+-	u32 *dbbuf_eis;
+-	dma_addr_t dbbuf_eis_dma_addr;
+-
+-	/* host memory buffer support: */
+-	u64 host_mem_size;
+-	u32 nr_host_mem_descs;
+-	dma_addr_t host_mem_descs_dma;
+-	struct nvme_host_mem_buf_desc *host_mem_descs;
+-	void **host_mem_desc_bufs;
+-};
+-
+ static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
+ {
+ 	int n = 0, ret;
+@@ -156,59 +114,6 @@ static inline struct nvme_dev *to_nvme_dev(struct nvme_ctrl *ctrl)
+ 	return container_of(ctrl, struct nvme_dev, ctrl);
+ }
+ 
+-/*
+- * An NVM Express queue.  Each device has at least two (one for admin
+- * commands and one for I/O commands).
+- */
+-struct nvme_queue {
+-	struct nvme_dev *dev;
+-	spinlock_t sq_lock;
+-	void *sq_cmds;
+-	 /* only used for poll queues: */
+-	spinlock_t cq_poll_lock ____cacheline_aligned_in_smp;
+-	volatile struct nvme_completion *cqes;
+-	dma_addr_t sq_dma_addr;
+-	dma_addr_t cq_dma_addr;
+-	u32 __iomem *q_db;
+-	u16 q_depth;
+-	u16 cq_vector;
+-	u16 sq_tail;
+-	u16 last_sq_tail;
+-	u16 cq_head;
+-	u16 qid;
+-	u8 cq_phase;
+-	u8 sqes;
+-	unsigned long flags;
+-#define NVMEQ_ENABLED		0
+-#define NVMEQ_SQ_CMB		1
+-#define NVMEQ_DELETE_ERROR	2
+-#define NVMEQ_POLLED		3
+-	u32 *dbbuf_sq_db;
+-	u32 *dbbuf_cq_db;
+-	u32 *dbbuf_sq_ei;
+-	u32 *dbbuf_cq_ei;
+-	struct completion delete_done;
+-};
+-
+-/*
+- * The nvme_iod describes the data in an I/O.
+- *
+- * The sg pointer contains the list of PRP/SGL chunk allocations in addition
+- * to the actual struct scatterlist.
+- */
+-struct nvme_iod {
+-	struct nvme_request req;
+-	struct nvme_queue *nvmeq;
+-	bool use_sgl;
+-	int aborted;
+-	int npages;		/* In the PRP list. 0 means small pool in use */
+-	int nents;		/* Used in scatterlist */
+-	dma_addr_t first_dma;
+-	unsigned int dma_len;	/* length of single DMA segment mapping */
+-	dma_addr_t meta_dma;
+-	struct scatterlist *sg;
+-};
+-
+ static unsigned int max_io_queues(void)
+ {
+ 	return num_possible_cpus() + write_queues + poll_queues;
+@@ -472,17 +377,19 @@ static inline void nvme_write_sq_db(struct nvme_queue *nvmeq, bool write_sq)
+  * @cmd: The command to send
+  * @write_sq: whether to write to the SQ doorbell
+  */
+-static void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
++void nvme_submit_cmd(struct nvme_queue *nvmeq, struct nvme_command *cmd,
+ 			    bool write_sq)
+ {
+-	spin_lock(&nvmeq->sq_lock);
++	unsigned long flags;
++	spin_lock_irqsave(&nvmeq->sq_lock, flags);
+ 	memcpy(nvmeq->sq_cmds + (nvmeq->sq_tail << nvmeq->sqes),
+ 	       cmd, sizeof(*cmd));
+ 	if (++nvmeq->sq_tail == nvmeq->q_depth)
+ 		nvmeq->sq_tail = 0;
+ 	nvme_write_sq_db(nvmeq, write_sq);
+-	spin_unlock(&nvmeq->sq_lock);
++	spin_unlock_irqrestore(&nvmeq->sq_lock, flags);
+ }
++EXPORT_SYMBOL_GPL(nvme_submit_cmd);
+ 
+ static void nvme_commit_rqs(struct blk_mq_hw_ctx *hctx)
+ {
+@@ -791,7 +698,7 @@ static blk_status_t nvme_setup_sgl_simple(struct nvme_dev *dev,
+ 	return 0;
+ }
+ 
+-static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
++blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
+ 		struct nvme_command *cmnd)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+@@ -841,8 +748,9 @@ static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
+ 		nvme_unmap_data(dev, req);
+ 	return ret;
+ }
++EXPORT_SYMBOL_GPL(nvme_map_data);
+ 
+-static blk_status_t nvme_map_metadata(struct nvme_dev *dev, struct request *req,
++blk_status_t nvme_map_metadata(struct nvme_dev *dev, struct request *req,
+ 		struct nvme_command *cmnd)
+ {
+ 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+@@ -854,6 +762,7 @@ static blk_status_t nvme_map_metadata(struct nvme_dev *dev, struct request *req,
+ 	cmnd->rw.metadata = cpu_to_le64(iod->meta_dma);
+ 	return 0;
+ }
++EXPORT_SYMBOL_GPL(nvme_map_metadata); 
+ 
+ /*
+  * NOTE: ns is NULL when called on the admin queue.
+@@ -968,7 +877,70 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 
+ 	req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), cqe->command_id);
+ 	trace_nvme_sq(req, cqe->sq_head, nvmeq->sq_tail);
+-	nvme_end_request(req, cqe->status, cqe->result);
++
++	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
++	//struct nvme_queue *nvmeq = iod->nvmeq;
++	struct nvme_ns *ns = req->q->queuedata;
++	struct nvme_dev *dev = iod->nvmeq->dev;
++	struct nvme_command cmnd;
++	blk_status_t ret;
++
++#ifdef CONFIG_NVME_TREENVME
++	if (req->cmd_flags & REQ_TREENVME)
++	{
++		/*
++		printk(KERN_ERR "GOT HERE -- rebound \n");
++		if (req->alter_count < dep_depth)
++		{
++			req->alter_count += 1;
++			// alter
++			ret = nvme_setup_cmd(ns, req, &cmnd);
++			if (ret)
++				printk(KERN_ERR "submit error\n");
++			//printk(KERN_ERR "Got here 2\n");x
++			if (blk_rq_nr_phys_segments(req)) {
++				ret = nvme_map_data(dev, req, &cmnd);
++				if (ret)
++					printk(KERN_ERR "mapping error\n");
++			}
++			if (blk_integrity_rq(req)) {
++				ret = nvme_map_metadata(dev, req, &cmnd);
++				if (ret)
++					printk(KERN_ERR "meta error\n");
++			}
++			cmnd.rw.slba = cpu_to_le64(nvme_sect_to_lba(ns, blk_rq_pos(req)));
++			nvme_req(req)->cmd = &cmnd;
++			printk(KERN_ERR "SECTOR NUMBER IS %d\n", cmnd.rw.slba);
++
++			int ret;
++			struct bio_vec bvec;
++			struct req_iterator iter;
++
++			rq_for_each_segment(bvec, req, iter)
++			{
++				char *buffer = bio_data(req->bio);
++				printk(KERN_ERR "char bio: %s \n", buffer);
++			}
++			nvme_submit_cmd(nvmeq, &cmnd, true);
++		}
++		else
++		{
++			//printk(KERN_ERR "Final\n");
++			req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
++			nvme_end_request(req, cqe->status, cqe->result);
++		}
++		*/
++		nvme_backpath(nvmeq, idx, req, cqe);
++	}
++	else {
++		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
++		nvme_end_request(req, cqe->status, cqe->result);
++	}
++#else
++		req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), req->first_command_id);
++		nvme_end_request(req, cqe->status, cqe->result);
++#endif
++	
+ }
+ 
+ static inline void nvme_update_cq_head(struct nvme_queue *nvmeq)
+@@ -2100,7 +2072,7 @@ static int nvme_setup_io_queues(struct nvme_dev *dev)
+ 
+ 	if (nr_io_queues == 0)
+ 		return 0;
+-	
++
+ 	clear_bit(NVMEQ_ENABLED, &adminq->flags);
+ 
+ 	if (dev->cmb_use_sqes) {
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 32868fbedc9e..a9b4b21d9a26 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -244,6 +244,10 @@ struct request {
+ 	 */
+ 	rq_end_io_fn *end_io;
+ 	void *end_io_data;
++
++	unsigned int alter_count;
++	unsigned int total_count;
++	__u16 first_command_id;
+ };
+ 
+ static inline bool blk_op_is_scsi(unsigned int op)
+diff --git a/kernel/kheaders.c b/kernel/kheaders.c
+deleted file mode 100644
+index 8f69772af77b..000000000000
+--- a/kernel/kheaders.c
++++ /dev/null
+@@ -1,66 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/*
+- * Provide kernel headers useful to build tracing programs
+- * such as for running eBPF tracing tools.
+- *
+- * (Borrowed code from kernel/configs.c)
+- */
+-
+-#include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/kobject.h>
+-#include <linux/init.h>
+-
+-/*
+- * Define kernel_headers_data and kernel_headers_data_end, within which the
+- * compressed kernel headers are stored. The file is first compressed with xz.
+- */
+-
+-asm (
+-"	.pushsection .rodata, \"a\"		\n"
+-"	.global kernel_headers_data		\n"
+-"kernel_headers_data:				\n"
+-"	.incbin \"kernel/kheaders_data.tar.xz\"	\n"
+-"	.global kernel_headers_data_end		\n"
+-"kernel_headers_data_end:			\n"
+-"	.popsection				\n"
+-);
+-
+-extern char kernel_headers_data;
+-extern char kernel_headers_data_end;
+-
+-static ssize_t
+-ikheaders_read(struct file *file,  struct kobject *kobj,
+-	       struct bin_attribute *bin_attr,
+-	       char *buf, loff_t off, size_t len)
+-{
+-	memcpy(buf, &kernel_headers_data + off, len);
+-	return len;
+-}
+-
+-static struct bin_attribute kheaders_attr __ro_after_init = {
+-	.attr = {
+-		.name = "kheaders.tar.xz",
+-		.mode = 0444,
+-	},
+-	.read = &ikheaders_read,
+-};
+-
+-static int __init ikheaders_init(void)
+-{
+-	kheaders_attr.size = (&kernel_headers_data_end -
+-			      &kernel_headers_data);
+-	return sysfs_create_bin_file(kernel_kobj, &kheaders_attr);
+-}
+-
+-static void __exit ikheaders_cleanup(void)
+-{
+-	sysfs_remove_bin_file(kernel_kobj, &kheaders_attr);
+-}
+-
+-module_init(ikheaders_init);
+-module_exit(ikheaders_cleanup);
+-
+-MODULE_LICENSE("GPL v2");
+-MODULE_AUTHOR("Joel Fernandes");
+-MODULE_DESCRIPTION("Echo the kernel header artifacts used to build the kernel");
