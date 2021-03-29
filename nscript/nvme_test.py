@@ -7,6 +7,7 @@ if __name__ == "__main__":
 
     parser.add_option("", "--insert", dest="ins", action="store_true", default=False)
     parser.add_option("", "--check", dest="chk", action="store_true", default=True)
+    parser.add_option("", "--cn", dest="cn", action="store_true", default=False)
     (opts, args) = parser.parse_args()
 
     filename = '/dev/nvme0n1'
@@ -54,7 +55,6 @@ if __name__ == "__main__":
             print(ilr)
             p2 = subprocess.Popen(ilr, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             
-
     if opts.ins and opts.chk:
         ou = p2.stdout.read()[0:(bs)]
         with open(fn, 'rb') as f1:
@@ -65,4 +65,8 @@ if __name__ == "__main__":
             print("Problem between {} and {}", ou, fou)
     else:
         ou = p2.stdout.read()[0:bs]
-        print('RESULT:', ou)
+        if opts.cn:
+            print('NUM:', ou[:4])
+            print('TYPE:', ou[4:8])
+        else:
+            print('RESULT:', ou)
