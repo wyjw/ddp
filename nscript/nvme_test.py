@@ -69,6 +69,6 @@ if __name__ == "__main__":
             print('NUM:', ou[:4])
             print('TYPE:', ou[4:8])
             for i in range((int)((512-8)/(4+4))):
-                print('ele{}: k{},p{}' .format(i,int(ou[8+i:8+i+4]),int(ou[8+i+4:8+i+8])))
+                print('ele{}: k{},p{}' .format(i,int(ou[8+i:8+i+4], 16),int(ou[8+i+4:8+i+8], 16)))
         else:
             print('RESULT:', ou)
