@@ -1,0 +1,467 @@
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 4f57d27bfa73..920e534ef002 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -27,6 +27,7 @@
+ #include <linux/crash_dump.h>
+ #include <linux/prefetch.h>
+ #include <linux/blk-crypto.h>
++#include <linux/nvme.h>
+ 
+ #include <trace/events/block.h>
+ 
+@@ -599,6 +600,10 @@ void blk_mq_force_complete_rq(struct request *rq)
+ 	bool shared = false;
+ 	int cpu;
+ 
++	int k=0;
++	int knum;
++	int kcount=0;
++
+ 	WRITE_ONCE(rq->state, MQ_RQ_COMPLETE);
+ 	/*
+ 	 * Most of single queue controllers, there is only one irq vector
+diff --git a/drivers/nvme/host/Makefile b/drivers/nvme/host/Makefile
+index fc7b26be692d..98ef4f8145d2 100644
+--- a/drivers/nvme/host/Makefile
++++ b/drivers/nvme/host/Makefile
+@@ -18,6 +18,8 @@ nvme-core-$(CONFIG_NVME_HWMON)		+= hwmon.o
+ 
+ nvme-y					+= pci.o
+ 
++nvme-y                                  += bpf_ddp.o    
++
+ nvme-fabrics-y				+= fabrics.o
+ 
+ nvme-rdma-y				+= rdma.o
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index c2c5bc4fb702..f011e0ad50b7 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -288,7 +288,34 @@ void nvme_complete_rq(struct request *req)
+ 			return;
+ 		}
+ 	}
+-
++	/*
++	int knum=0;
++	int kcount=0;
++	if (bio_has_data(req->bio))
++	{
++		//dma_unmap_page(nvmeq->dev->dev, iod->first_dma, iod->dma_len, rq_dma_dir(req));
++		//dma_sync_sg_for_cpu(nvmeq->dev->ctrl.device, iod->sg, iod->nents, rq_dma_dir(req));
++		struct bio_vec bvec = req_bvec(req);
++	    char *buffer = bio_data(req->bio);
++	    //char *buffer = kmap_atomic(bvec.bv_page);
++	    unsigned long offset = bvec.bv_offset;
++	    size_t len = bvec.bv_len;
++
++	    printk(KERN_ERR "one word:\n");
++	    printk(KERN_ERR "We got bvec len%d, bvec offset %lu\n", len, offset);
++	    for (knum = bvec.bv_offset; knum < bvec.bv_offset + bvec.bv_len; knum++)
++	    {
++	    	kcount += 1;
++	    	if (kcount % 1024 == 0)
++	    		printk(KERN_ERR "%d", (int)buffer[knum]);
++	    		
++	    		//if ((int)(buffer[knum]))
++				//	printk(KERN_ERR "%c", buffer[knum]);
++				
++		}
++		//kunmap_atomic(buffer);
++	}
++*/
+ 	nvme_trace_bio_complete(req, status);
+ 	blk_mq_end_request(req, status);
+ }
+@@ -3040,6 +3067,16 @@ int nvme_init_identify(struct nvme_ctrl *ctrl)
+ }
+ EXPORT_SYMBOL_GPL(nvme_init_identify);
+ 
++/*@ddp*/
++struct nvme_ctrl *nvme_ctrl_get_from_fd(int fd){
++  struct file *f = fget_raw(fd);
++  struct inode* inode = f->f_inode;
++  struct nvme_ctrl *ctrl = container_of(inode->i_cdev, struct nvme_ctrl, cdev);
++  fput(f);
++  return ctrl;
++}
++
++
+ static int nvme_dev_open(struct inode *inode, struct file *file)
+ {
+ 	struct nvme_ctrl *ctrl =
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index c0f4226d3299..fdf692534b6b 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -37,6 +37,7 @@ extern unsigned int admin_timeout;
+ #define  NVME_INLINE_METADATA_SG_CNT  1
+ #endif
+ 
++struct bpf_prog_array; /*@ddp*/
+ extern struct workqueue_struct *nvme_wq;
+ extern struct workqueue_struct *nvme_reset_wq;
+ extern struct workqueue_struct *nvme_delete_wq;
+@@ -300,6 +301,7 @@ struct nvme_ctrl {
+ 	unsigned long discard_page_busy;
+ 
+ 	struct nvme_fault_inject fault_inject;
++	struct bpf_prog_array *progs; /*@ddp*/
+ };
+ 
+ enum nvme_iopolicy {
+@@ -709,5 +711,6 @@ void nvme_hwmon_init(struct nvme_ctrl *ctrl);
+ #else
+ static inline void nvme_hwmon_init(struct nvme_ctrl *ctrl) { }
+ #endif
+-
++int ddp_bpf_run(struct nvme_ctrl* ctrl, char* buffer); /*@ddp*/
++struct nvme_ctrl *nvme_ctrl_get_from_fd(int fd); /*@ddp*/
+ #endif /* _NVME_H */
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index e2bacd369a88..607813098645 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -568,13 +568,37 @@ static void nvme_print_sgl(struct scatterlist *sgl, int nents)
+ 
+ 	for_each_sg(sgl, sg, nents, i) {
+ 		dma_addr_t phys = sg_phys(sg);
+-		pr_warn("sg[%d] phys_addr:%pad offset:%d length:%d "
+-			"dma_address:%pad dma_length:%d\n",
++		void* virt = phys_to_virt(phys);
++		pr_warn("sg[%d] phys_addr:%dvirt:%d,ad offset:%d length:%d "
++			"dma_address:%dad dma_length:%d\n",
++			i, &phys, &virt, sg->offset, sg->length, &sg_dma_address(sg),
++			sg_dma_len(sg));
++	}
++}
++
++
++static void nvme_print_sgl_virt(struct scatterlist *sgl, int nents)
++{
++	int i;
++	struct scatterlist *sg;
++
++	for_each_sg(sgl, sg, nents, i) {
++		char* phys = sg_virt(sg);
++		pr_warn("sg[%d] virt_addr:%dad offset:%d length:%d "
++			"dma_address:%dad dma_length:%d\n",
+ 			i, &phys, sg->offset, sg->length, &sg_dma_address(sg),
+ 			sg_dma_len(sg));
+ 	}
+ }
+ 
++
++static void nvme_print_iod(struct nvme_iod *iod)
++{
++	pr_warn("iod first_dma:%dn_pages:%d n_ents:%d "
++	"dma_len:%dmeta_dma:%duse_sgl:%d\n",
++	iod->first_dma, iod->npages, iod->nents, iod->dma_len, iod->meta_dma, iod->use_sgl);
++}
++
+ static blk_status_t nvme_pci_setup_prps(struct nvme_dev *dev,
+ 		struct request *req, struct nvme_rw_command *cmnd)
+ {
+@@ -826,6 +850,7 @@ static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
+ 		goto out;
+ 
+ 	iod->use_sgl = nvme_pci_use_sgls(dev, req);
++	//iod->use_sgl = true;
+ 	if (iod->use_sgl)
+ 		ret = nvme_pci_setup_sgls(dev, req, &cmnd->rw, nr_mapped);
+ 	else
+@@ -890,6 +915,8 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 			goto out_unmap_data;
+ 	}
+ 
++	printk(KERN_ERR "Submit Nvme req of %d\n", nvme_req(req));
++
+ 	blk_mq_start_request(req);
+ 	nvme_submit_cmd(nvmeq, &cmnd, bd->last);
+ 	return BLK_STS_OK;
+@@ -909,7 +936,9 @@ static void nvme_pci_complete_rq(struct request *req)
+ 		dma_unmap_page(dev->dev, iod->meta_dma,
+ 			       rq_integrity_vec(req)->bv_len, rq_data_dir(req));
+ 	if (blk_rq_nr_phys_segments(req))
++	{
+ 		nvme_unmap_data(dev, req);
++	}
+ 	nvme_complete_rq(req);
+ }
+ 
+@@ -962,7 +991,178 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 	}
+ 
+ 	req = blk_mq_tag_to_rq(nvme_queue_tagset(nvmeq), cqe->command_id);
++	//printk(KERN_ERR "Got command id of %d", cqe->command_id);
++	//printk(KERN_ERR "Completion Nvme req of %d\n", nvme_req(req));
++
++	//struct bio n_bio = req->bio;
++	// This checks the physical data.
++	// struct bio_vec b = req_bvec(req)
++	//
++	
++
++	/*
++	struct bio *bio;
++	struct req_iterator iter;
++	struct bio_vec bvec;
++	int count = 0;
++	rq_for_each_segment(bvec,req,iter){
++			char *buffer = bio_data(req->bio);
++			if (buffer!=NULL){
++				unsigned int i;
++				int num;
++				for (i = 0; i < bvec.bv_len; i++){
++					count += 1;
++		    		if (count % 1024 == 0)
++		    			printk(KERN_ERR "%d", (int)buffer[i]);
++				}
++
++			}
++			else{
++				printk(KERN_ERR "buffer is NULL \n");
++			}
++
++        }
++    */
++	
++	
++	
++
++	//printk(KERN_ERR "Got here on comletion: %s\n", str);
++	/*
++
++	char* iod_data; 
++	unsigned int j;
++	unsigned long not_last = 1;
++	
++	if (sclist != NULL && sclist->page_link != NULL){
++	       	printk(KERN_ERR "there is some command \n");
++		if (req_op(req)==REQ_OP_READ || req_op(req)==REQ_OP_WRITE){
++			if (req_op(req)==REQ_OP_READ){
++				printk(KERN_ERR "there is some read command \n");
++			}
++			if (req_op(req)==REQ_OP_WRITE){
++				 printk(KERN_ERR "there is some write command \n");
++			}
++
++			while (not_last){
++				not_last = !sg_is_last(sclist);
++				iod_data = (char*) sg_virt(sclist);
++	       			//for (j = 0; j < sclist->length; j++){
++					printk(KERN_ERR "print each char: %s\n",iod_data);
++					//iod_data++;
++				//}	
++				if (not_last){
++					sclist = sg_next(sclist);
++				}	
++			}	
++		}
++	
++	}
++	else{
++		 printk(KERN_ERR "not sgl commands\n");
++	}
++	
++	
++	*/
+ 	trace_nvme_sq(req, cqe->sq_head, nvmeq->sq_tail);
++	
++	/*
++	struct nvme_iod* iod = blk_mq_rq_to_pdu(req);
++	struct scatterlist* sclist = sample_iod->sg;
++	struct nvme_dev *dev = iod->nvmeq->dev;
++	nvme_print_iod(iod);
++	int j;
++	if (iod->first_dma && iod->dma_len)
++	{
++		//char *val = dma_alloc_coherent(dev->dev, iod->dma_len,
++		//	&iod->first_dma, GFP_KERNEL);
++		for (j = 0; j < iod->dma_len; j++)
++		{
++			char *a = (iod->first_dma + j);
++			int c = a;
++			if (c != 0)
++			{	
++				count += 1;
++				if (count % 100 == 0)
++				{
++					printk(KERN_ERR "%c", c);
++				}
++			}
++		}
++	}
++	*/
++    
++    /*
++	printk(KERN_ERR "doing io_uring bench\n");
++	struct nvme_iod* iod = blk_mq_rq_to_pdu(req);
++	nvme_print_iod(iod);
++	
++	int k=0;
++	int knum;
++	int kcount=0;
++	
++	struct req_iterator iter;
++	struct bio_vec bvec;
++	rq_for_each_segment(bvec,req,iter)
++	{
++		if (bio_has_data(req->bio))
++		{
++			dma_unmap_page(nvmeq->dev->dev, iod->first_dma, iod->dma_len, rq_dma_dir(req));
++			//dma_sync_sg_for_cpu(nvmeq->dev->ctrl.device, iod->sg, iod->nents, rq_dma_dir(req));
++			struct bio_vec bvec = req_bvec(req);
++		    char *buffer = bio_data(req->bio);
++		    char *buffer2 = kmap_atomic(bvec.bv_page);
++		    unsigned long offset = bvec.bv_offset;
++		    size_t len = bvec.bv_len;
++
++		    printk(KERN_ERR "one word:\n");
++		    printk(KERN_ERR "We got bvec len%d, bvec offset %lu\n", len, offset);
++		    for (knum = bvec.bv_offset; knum < bvec.bv_offset + bvec.bv_len; knum++)
++		    {
++		    	if ((int)buffer[knum] != 0)
++		    		printk(KERN_ERR "%c", buffer[knum]);
++		    	if ((int)buffer2[knum] != 0)
++		    		printk(KERN_ERR "%c", buffer2[knum]);
++		    		//if ((int)(buffer[knum]))
++					//	printk(KERN_ERR "%c", buffer[knum]);
++					
++			}
++			kunmap_atomic(buffer);
++		}
++	}
++	*/
++	   	
++		
++		/*
++		for (k = 0; k < bv.bv_len; k++){
++
++			knum = (int) buffer[k];
++			if (knum !=0){
++				kcount += 1;
++				if (kcount % 1000 == 0)
++				{
++					printk(KERN_ERR "char bio: %c \n", buffer[k]);
++				}
++			}
++		}
++		*/
++		
++	
++
++	//nvme_print_sgl(iod->sg, iod->nents);
++	/*@ddp*/
++	int ret;
++	struct bio_vec bvec;
++	struct req_iterator iter;
++
++	rq_for_each_segment(bvec, req, iter){
++		ret = ddp_bpf_run(&(nvmeq->dev->ctrl), bio_data(req->bio));
++	}
++	/*
++	if (ret){
++		printk(KERN_ERR "BPF Attached: %u \n", ret);
++	}
++	*/
+ 	nvme_end_request(req, cqe->status, cqe->result);
+ }
+ 
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 07052d44bca1..adbad78614f9 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -939,7 +939,7 @@ int bpf_prog_array_copy(struct bpf_prog_array *old_array,
+ 		_item = &_array->items[0];		\
+ 		while ((_prog = READ_ONCE(_item->prog))) {		\
+ 			bpf_cgroup_storage_set(_item->cgroup_storage);	\
+-			_ret &= func(_prog, ctx);	\
++			_ret = func(_prog, ctx);	\
+ 			_item++;			\
+ 		}					\
+ _out:							\
+@@ -947,7 +947,7 @@ _out:							\
+ 		migrate_enable();			\
+ 		_ret;					\
+ 	 })
+-
++/*@ddp*/
+ /* To be used by __cgroup_bpf_run_filter_skb for EGRESS BPF progs
+  * so BPF programs can request cwr for TCP packets.
+  *
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index a18ae82a298a..09d1a4934c1d 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -75,7 +75,8 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_LSM, lsm,
+ 	       void *, void *)
+ #endif /* CONFIG_BPF_LSM */
+ #endif
+-
++BPF_PROG_TYPE(BPF_PROG_TYPE_DDP,ddp,
++		char*, char*) /*@ddp*/
+ BPF_MAP_TYPE(BPF_MAP_TYPE_ARRAY, array_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_PERCPU_ARRAY, percpu_array_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_PROG_ARRAY, prog_array_map_ops)
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 19684813faae..0b03029d6f2f 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -189,6 +189,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_STRUCT_OPS,
+ 	BPF_PROG_TYPE_EXT,
+ 	BPF_PROG_TYPE_LSM,
++	BPF_PROG_TYPE_DDP, /*@ddp*/
+ };
+ 
+ enum bpf_attach_type {
+@@ -226,6 +227,7 @@ enum bpf_attach_type {
+ 	BPF_CGROUP_INET4_GETSOCKNAME,
+ 	BPF_CGROUP_INET6_GETSOCKNAME,
+ 	BPF_XDP_DEVMAP,
++	BPF_DDP, /*@ddp*/
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 8da159936bab..16d8a7f68305 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -4,6 +4,7 @@
+ #include <linux/bpf.h>
+ #include <linux/bpf_trace.h>
+ #include <linux/bpf_lirc.h>
++#include <linux/bpf_ddp.h> /*@ddp*/
+ #include <linux/btf.h>
+ #include <linux/syscalls.h>
+ #include <linux/slab.h>
+@@ -2815,6 +2816,8 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
+ 		return BPF_PROG_TYPE_CGROUP_SOCKOPT;
+ 	case BPF_TRACE_ITER:
+ 		return BPF_PROG_TYPE_TRACING;
++	case BPF_DDP: /*@ddp*/
++		return BPF_PROG_TYPE_DDP; 
+ 	default:
+ 		return BPF_PROG_TYPE_UNSPEC;
+ 	}
+@@ -2870,6 +2873,9 @@ static int bpf_prog_attach(const union bpf_attr *attr)
+ 	case BPF_PROG_TYPE_SOCK_OPS:
+ 		ret = cgroup_bpf_prog_attach(attr, ptype, prog);
+ 		break;
++	case BPF_PROG_TYPE_DDP: /*@ddp*/
++		ret = ddp_prog_attach(attr, prog);
++		break;
+ 	default:
+ 		ret = -EINVAL;
+ 	}
+@@ -2908,6 +2914,8 @@ static int bpf_prog_detach(const union bpf_attr *attr)
+ 	case BPF_PROG_TYPE_CGROUP_SYSCTL:
+ 	case BPF_PROG_TYPE_SOCK_OPS:
+ 		return cgroup_bpf_prog_detach(attr, ptype);
++	case BPF_PROG_TYPE_DDP: /*@ddp*/
++		return ddp_prog_detach(attr); /*@ddp*/
+ 	default:
+ 		return -EINVAL;
+ 	}
